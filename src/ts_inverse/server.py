@@ -18,12 +18,14 @@ class CustomStrategy(fl.server.strategy.FedAvg):
         #     # Save weights
         #     print(f"Saving round {rnd} weights...")
         #     np.savez(f"../out/04_federated_learning_models/round-{rnd}-weights.npz", *weights)
+        self.weight = weights
         return weights
 
 
 def evaluate_metrics_aggregation(metrics):
     print("Evaluate Metrics:", metrics)
     # Multiply accuracy of each client by number of examples used
+    return {metric_name: [metric[1][metric_name] for metric in metrics] for metric_name in metrics[0][1].keys()}
     maes = [num_examples * m["mae"] for num_examples, m in metrics]
     examples = [num_examples for num_examples, _ in metrics]
 

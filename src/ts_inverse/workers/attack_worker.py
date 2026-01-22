@@ -80,7 +80,7 @@ class AttackWorker(Worker):
     def generate_dummy_data(self, batch_input_example, batch_target_example, config):
         all_dummy_inputs, all_dummy_targets = [], []
         attack_number_of_batches = (
-            config["attack_number_of_batches"] if "attack_number_of_batches" in config else config["number_if_batches"]
+            config["attack_number_of_batches"] if "attack_number_of_batches" in config else config["number_of_batches"]
         )
 
         if "dummy_init_method" not in config or config["dummy_init_method"] == "rand":

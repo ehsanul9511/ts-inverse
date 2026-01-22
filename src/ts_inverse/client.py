@@ -5,8 +5,10 @@ import flwr as fl
 from collections import OrderedDict
 import warnings
 
-import datahandler
-import utils
+from ts_inverse import datahandler
+from ts_inverse import utils
+
+from ts_inverse.attack_time_series_utils import SMAPELoss
 
 warnings.filterwarnings("ignore")
 
@@ -27,7 +29,7 @@ class TimeSeriesClient(fl.client.NumPyClient):
         self.trainset = trainset
         self.valset = valset
         self.testset = testset
-        print(f"Client {dataset_config['columns']} initialized.")
+        # print(f"Client {dataset_config['columns']} initialized.")
 
     def get_parameters(self):
         """Return the current parameters."""
@@ -59,7 +61,9 @@ class TimeSeriesClient(fl.client.NumPyClient):
         self.set_parameters(parameters)
         test_mse_loss = utils.evaluate_model(self.model, self.testset, device=self.device)
         test_mae_loss = utils.evaluate_model(self.model, self.testset, criterion=F.l1_loss, device=self.device)
-        return float(test_mse_loss), len(self.testset), {"mae": float(test_mae_loss)}
+        test_rmse_loss = test_mse_loss**0.5
+        test_smape_loss = utils.evaluate_model(self.model, self.testset, criterion=SMAPELoss, device=self.device)
+        return float(test_mse_loss), len(self.testset), {"mae": float(test_mae_loss), "mse": float(test_mse_loss), "rmse": float(test_rmse_loss), "smape": float(test_smape_loss)}
 
 
 def client_factory(d_config, m_config, device, num_clients):
@@ -71,12 +75,15 @@ def client_factory(d_config, m_config, device, num_clients):
     print(f"Loading dataset for {num_clients} clients:", d_config)
     dataset_df, dataset_class = datahandler.get_dataset_df(d_config["dataset"])
     datasets_for_client_ids = []
-    del d_config["dataset"]
+    if "dataset" in d_config:
+        del d_config["dataset"]
     for i in range(num_clients):
         datasets_for_client_ids.append(datahandler.get_datasets_from_df(dataset_df, dataset_class, i, **d_config))
     print("Finished loading datasets.")
 
-    def client_fn(client_id):
+    def client_fn(context):
+        client_id = context.node_config["partition-id"]
+
         print(f"Loading client {client_id}")
         d_config["columns"] = int(client_id)
         return TimeSeriesClient(m_config, d_config, datasets_for_client_ids[int(client_id)], device).to_client()

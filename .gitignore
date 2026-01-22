@@ -8,6 +8,11 @@
 
 */wandb/*
 
+wandb/*
+
+notebooks/*/*.toml
+notebooks/*/*.pkl
+
 .env
 data/*/*.zip
 data/*/*.csv

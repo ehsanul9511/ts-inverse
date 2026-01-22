@@ -282,7 +282,7 @@ class AttackTSInverseWorker(AttackLearningToInvertWorker):
                 dummy_targets, regularization_targets
             )
         else:
-            raise NotImplementedError(f"Inversion regularization loss not found: {config["inversion_regularization_loss"]}")
+            raise NotImplementedError(f"Inversion regularization loss not found: {config['inversion_regularization_loss']}")
         return learned_prior_regularization
 
     def initialize_inversion_model(self, config, batch_inputs, batch_targets):
