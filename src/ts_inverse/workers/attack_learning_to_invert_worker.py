@@ -8,14 +8,15 @@ from torch.utils.data import DataLoader, ConcatDataset, TensorDataset
 
 import pandas as pd
 import matplotlib.pyplot as plt
+
+from scipy.optimize import linear_sum_assignment
+
 from ts_inverse.datahandler import get_mean_std_dataloader, ConcatSliceDataset
 
 from ts_inverse.attack_time_series_utils import interpolate
 from ts_inverse.models.grad_to_input import ImprovedGradToInputNN, ImprovedGradToInputNN_2
 from ts_inverse.utils import seed_worker
 from ts_inverse.models import GradToInputNN
-
-from scipy.optimize import linear_sum_assignment
 
 from ts_inverse.utils import set_seed, seed_worker
 # from .attack_worker import AttackWorker, plot_original_and_dummy_data
