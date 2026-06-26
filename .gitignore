@@ -19,4 +19,6 @@ data/*/*.csv
 data/*/*.tsf
 data/*/*.pt
 data/*/*.txt
+data/*
+*.txt
 media/*

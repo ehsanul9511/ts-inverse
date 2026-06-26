@@ -9,6 +9,7 @@ import pandas as pd
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
@@ -28,7 +29,7 @@ from ts_inverse.models import GradToInputNN, ImprovedGradToInputNN_Probabilistic
 from ts_inverse.utils import set_seed, seed_worker
 # from .attack_worker import AttackWorker, plot_original_and_dummy_data
 from .worker import Worker
-from ts_inverse.datahandler import ConcatSliceDataset, get_mean_std_dataloader
+from ts_inverse.datahandler import ConcatSliceDataset, get_mean_std_dataloader, get_har_dataset
 from .forecasting_worker import evaluate_model
 
 
@@ -39,15 +40,31 @@ class AttackTSInverseWorker(Worker):
 
     def _init_attack_worker_process(self, c, d_c, m_c, fam_c, def_c=None):
         final_model_settings = {**m_c, **fam_c}
-        self.train_datasets, self.val_datasets, self.test_datasets = self.get_datasets(**d_c)
+        dataset_name = d_c["dataset"]
+        if dataset_name == "realworld":
+            self.train_datasets, self.val_datasets, self.test_datasets = get_har_dataset()
+            print("Loaded realworld HAR dataset")
+            # import sys; sys.exit(0)
+        else:
+            self.train_datasets, self.val_datasets, self.test_datasets = self.get_datasets(**d_c)
         self.g = set_seed(c["seed"])
-        train_dataloader = DataLoader(
-            ConcatSliceDataset(self.train_datasets),
-            batch_size=c["batch_size"],
-            shuffle=True,
-            worker_init_fn=seed_worker,
-            generator=self.g,
-        )
+
+        # if dataset == "realworld":
+        #     train_dataloader = DataLoader(self.train_datasets, shuffle=True, batch_size=c["batch_size"], worker_init_fn=seed_worker, generator=self.g)
+        if dataset_name == "realworld":
+            train_dataloader = DataLoader(
+                ConcatDataset(self.train_datasets),
+                batch_size=c["batch_size"],
+                shuffle=True
+            )
+        else:
+            train_dataloader = DataLoader(
+                ConcatSliceDataset(self.train_datasets),
+                batch_size=c["batch_size"],
+                shuffle=True,
+                worker_init_fn=seed_worker,
+                generator=self.g,
+            )
 
         mean_std_dataloader = DataLoader(
             ConcatSliceDataset(self.train_datasets),
@@ -60,16 +77,27 @@ class AttackTSInverseWorker(Worker):
             mean_std_dataloader, c["device"]
         )
 
-        freq_in_day = self.train_datasets[0].freq_in_day
-        model_settings = {key: value for key, value in final_model_settings.items() if not key.startswith("_")}
-        for key, value in model_settings.items():
-            if key.startswith("input_") or key.startswith("output_"):
-                model_settings[key] = value * freq_in_day
-                final_model_settings[key] = value * freq_in_day
+        if dataset_name == "realworld":
+            model = final_model_settings["_model"]()
+            # model = final_model_settings["_model"](embed_dim=128, depth=5, num_heads=2, mlp_ratio=1, 
+            #             norm_layer=nn.LayerNorm, node_dim=9, window_size=150, node_num=7,
+            #             decoder_embed_dim=64, decoder_depth=1, decoder_num_heads=1,
+            #             mask_ratio=0.5, len_mask=1)
+            # model = final_model_settings["_model"](embed_dim=128, depth=5, 
+            #             num_heads=2, mlp_ratio=1,
+            #             norm_layer=nn.LayerNorm, node_dim=9, window_size=150, node_num=7, num_classes=8)
+        else:
+            freq_in_day = self.train_datasets[0].freq_in_day
+            model_settings = {key: value for key, value in final_model_settings.items() if not key.startswith("_")}
+            for key, value in model_settings.items():
+                if key.startswith("input_") or key.startswith("output_"):
+                    model_settings[key] = value * freq_in_day
+                    final_model_settings[key] = value * freq_in_day
 
-        model = final_model_settings["_model"](**model_settings)  # Create model
+            model = final_model_settings["_model"](**model_settings)  # Create model
 
-        final_model_settings.update(model.extra_info)
+            final_model_settings.update(model.extra_info)
+
         final_config = {**c, **d_c, **final_model_settings}
 
         print("def_c", def_c)
@@ -111,7 +139,9 @@ class AttackTSInverseWorker(Worker):
             self.all_batch_inputs[0], self.all_batch_targets[0], config
         )
 
-        self.inputs_mean, self.inputs_std = self.inputs_mean[model.features], self.inputs_std[model.features]
+        dataset_name = config["dataset"]
+        if dataset_name != "realworld":
+            self.inputs_mean, self.inputs_std = self.inputs_mean[model.features], self.inputs_std[model.features]
         self.targets_mean, self.targets_std = self.targets_mean[0], self.targets_std[0]
         config["model_size"] = sum(p.numel() for p in model.parameters())
 
@@ -133,12 +163,20 @@ class AttackTSInverseWorker(Worker):
             aux_valset = ConcatDataset(self.val_datasets)
 
         # Prior knowledge datasets
-        self.auxiliary_train_dataloader = DataLoader(
-            aux_trainset, batch_size=1, shuffle=False, worker_init_fn=seed_worker, generator=self.g
-        )
-        self.auxiliary_val_dataloader = DataLoader(
-            aux_valset, batch_size=1, shuffle=False, worker_init_fn=seed_worker, generator=self.g
-        )
+        if dataset_name == "realworld":
+            self.auxiliary_train_dataloader = DataLoader(
+                aux_trainset, batch_size=128, shuffle=False
+            )
+            self.auxiliary_val_dataloader = DataLoader(
+                aux_valset, batch_size=128, shuffle=False
+            )
+        else:
+            self.auxiliary_train_dataloader = DataLoader(
+                aux_trainset, batch_size=1, shuffle=False, worker_init_fn=seed_worker, generator=self.g
+            )
+            self.auxiliary_val_dataloader = DataLoader(
+                aux_valset, batch_size=1, shuffle=False, worker_init_fn=seed_worker, generator=self.g
+            )
         config["auxiliary_train_dataset_size"] = len(self.auxiliary_train_dataloader.dataset)
         config["auxiliary_val_dataset_size"] = len(self.auxiliary_val_dataloader.dataset)
 
@@ -329,7 +367,8 @@ class AttackTSInverseWorker(Worker):
         )
 
         sample_mapping = np.arange(0, batch_inputs.shape[0])
-        plot_original_and_dummy_data(config, sample_mapping, dummy_inputs, dummy_targets, batch_inputs, batch_targets)
+        if config["dataset"] != "realworld":
+            plot_original_and_dummy_data(config, sample_mapping, dummy_inputs, dummy_targets, batch_inputs, batch_targets)
 
         for attack_step in range(0, config["num_attack_steps"] + 1):
             attack_metrics = {
@@ -343,7 +382,13 @@ class AttackTSInverseWorker(Worker):
                 dy_dx_loss = torch.zeros(1, device=dummy_inputs.device)
 
                 dummy_out = model(dummy_inputs)
-                dummy_y = F.mse_loss(dummy_out, dummy_targets)
+                # print(f"len(dummy_out): {len(dummy_out)}")
+                # print(f"dummy_out item shapes: {[dummy_out_i.shape for dummy_out_i in dummy_out]}")
+                # print(f"dummy_targets shape: {dummy_targets.shape}")
+                if config["dataset"] == "realworld":
+                    dummy_y = nn.CrossEntropyLoss()(dummy_out, dummy_targets)
+                else:
+                    dummy_y = F.mse_loss(dummy_out, dummy_targets)
                 dummy_dy_dx = torch.autograd.grad(dummy_y, model.parameters(), create_graph=True)
 
                 if attack_step >= config["num_attack_steps"]:
@@ -381,44 +426,45 @@ class AttackTSInverseWorker(Worker):
                         dummy_targets.unsqueeze(-1)
                     )
 
-                combined_dummy_data_first_feature = torch.cat([dummy_inputs[:, :, 0], dummy_targets[:, :]], dim=1)  # Same series
-                if "lower_res_term_inputs" in config and config["lower_res_term_inputs"] > 0:
-                    with torch.no_grad():
-                        warped_inputs = temporal_resolution_warping(dummy_inputs, 2)
-                        filtered_inputs = interpolate(warped_inputs, dummy_inputs.shape[1])
-                    dy_dx_loss += config["lower_res_term_inputs"] * F.l1_loss(filtered_inputs, dummy_inputs)
+                if config["dataset"] != "realworld":
+                    combined_dummy_data_first_feature = torch.cat([dummy_inputs[:, :, 0], dummy_targets[:, :]], dim=1)  # Same series
+                    if "lower_res_term_inputs" in config and config["lower_res_term_inputs"] > 0:
+                        with torch.no_grad():
+                            warped_inputs = temporal_resolution_warping(dummy_inputs, 2)
+                            filtered_inputs = interpolate(warped_inputs, dummy_inputs.shape[1])
+                        dy_dx_loss += config["lower_res_term_inputs"] * F.l1_loss(filtered_inputs, dummy_inputs)
 
-                if "lower_res_term_targets" in config and config["lower_res_term_targets"] > 0:
-                    with torch.no_grad():
-                        warped_targets = temporal_resolution_warping(dummy_targets.unsqueeze(-1), 2)
-                        filtered_targets = interpolate(warped_targets, dummy_targets.shape[1]).squeeze(-1)
-                    dy_dx_loss += config["lower_res_term_targets"] * F.l1_loss(filtered_targets, dummy_targets)
+                    if "lower_res_term_targets" in config and config["lower_res_term_targets"] > 0:
+                        with torch.no_grad():
+                            warped_targets = temporal_resolution_warping(dummy_targets.unsqueeze(-1), 2)
+                            filtered_targets = interpolate(warped_targets, dummy_targets.shape[1]).squeeze(-1)
+                        dy_dx_loss += config["lower_res_term_targets"] * F.l1_loss(filtered_targets, dummy_targets)
 
-                if "trend_term" in config and config["trend_term"] > 0:
-                    lr_term = (
-                        dummy_schedular.get_last_lr()[0] / config["optimization_learning_rate"]
-                        if attack_step > 0 and config["trend_reduce_lr"]
-                        else 1
-                    )
-                    dy_dx_loss += (
-                        lr_term
-                        * config["trend_term"]
-                        * trend_consistency_regularization(combined_dummy_data_first_feature, config["trend_loss"])
-                    )
-
-                if "periodicity_term" in config and config["periodicity_term"] > 0:
-                    lr_term = (
-                        dummy_schedular.get_last_lr()[0] / config["optimization_learning_rate"]
-                        if attack_step > 0 and config["trend_reduce_lr"]
-                        else 1
-                    )
-                    dy_dx_loss += (
-                        lr_term
-                        * config["periodicity_term"]
-                        * periodicity_regularization(
-                            combined_dummy_data_first_feature, period=dummy_targets.shape[1], loss=config["periodicity_loss"]
+                    if "trend_term" in config and config["trend_term"] > 0:
+                        lr_term = (
+                            dummy_schedular.get_last_lr()[0] / config["optimization_learning_rate"]
+                            if attack_step > 0 and config["trend_reduce_lr"]
+                            else 1
                         )
-                    )
+                        dy_dx_loss += (
+                            lr_term
+                            * config["trend_term"]
+                            * trend_consistency_regularization(combined_dummy_data_first_feature, config["trend_loss"])
+                        )
+
+                    if "periodicity_term" in config and config["periodicity_term"] > 0:
+                        lr_term = (
+                            dummy_schedular.get_last_lr()[0] / config["optimization_learning_rate"]
+                            if attack_step > 0 and config["trend_reduce_lr"]
+                            else 1
+                        )
+                        dy_dx_loss += (
+                            lr_term
+                            * config["periodicity_term"]
+                            * periodicity_regularization(
+                                combined_dummy_data_first_feature, period=dummy_targets.shape[1], loss=config["periodicity_loss"]
+                            )
+                        )
 
                 dy_dx_loss.backward()
 
@@ -836,10 +882,16 @@ class AttackTSInverseWorker(Worker):
                 torch.rand_like(batch_input_example, device=config["device"], requires_grad=True)
                 for _ in range(attack_number_of_batches)
             ]
-            all_dummy_targets = [
-                torch.rand_like(batch_target_example, device=config["device"], requires_grad=True)
-                for _ in range(attack_number_of_batches)
-            ]
+            if config["dataset"] == "realworld":
+                all_dummy_targets = [
+                    torch.randint(low=0, high=8, size=batch_target_example.shape, device=config["device"]).long()
+                    for _ in range(attack_number_of_batches)
+                ]
+            else:
+                all_dummy_targets = [
+                    torch.rand_like(batch_target_example, device=config["device"], requires_grad=True)
+                    for _ in range(attack_number_of_batches)
+                ]
         elif config["dummy_init_method"] == "halves":
             all_dummy_inputs = [
                 (torch.tensor(0.5) * torch.ones_like(batch_input_example, device=config["device"])).requires_grad_(True)
@@ -883,70 +935,113 @@ class AttackTSInverseWorker(Worker):
         return all_dummy_inputs, all_dummy_targets
 
     def train_model_and_record(self, model, tr_dataloader, config):
+        dataset = config["dataset"]
         model.to(config["device"])
-        model_optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
         all_batch_inputs, all_batch_targets, all_model_state_dicts, all_model_gradients, all_model_updates = [], [], [], [], []
+        if dataset == 'realworld':
+            optimizer = torch.optim.Adam(params=model.parameters(), lr=0.005)
+            total_batches_processed = 0  # Initialize total batch counter
+            total_batches_needed = config["warmup_number_of_batches"] + config["number_of_batches"]
 
-        total_batches_processed = 0  # Initialize total batch counter
-        total_batches_needed = config["warmup_number_of_batches"] + config["number_of_batches"]
-        val_dataset = ConcatSliceDataset(self.val_datasets)
-        while total_batches_processed < total_batches_needed:
-            for batch_inputs, batch_targets in tr_dataloader:
+            def func_loss(model, batch):
+                inputs, label = batch
+                logits = model(inputs)
+                loss = nn.CrossEntropyLoss()(logits, label)
+                return loss
+            
+            model.train()
+            for _, batch in enumerate(tr_dataloader):
                 if total_batches_processed >= total_batches_needed:
-                    break  # Exit if we've processed the total required batches
-                if not config["update_model"] and total_batches_processed > 0:
-                    model.load_state_dict(all_model_state_dicts[0])
+                    break
+                batch = [t.to(config["device"]) for t in batch]
+                optimizer.zero_grad()
+                loss = func_loss(model, batch)  
 
-                batch_inputs, batch_targets = (
-                    batch_inputs[:, :, model.features].to(config["device"]),
-                    batch_targets[:, :, 0].to(config["device"]),
-                )
-                if total_batches_processed >= config["warmup_number_of_batches"]:
-                    all_batch_inputs.append(batch_inputs.clone())
-                    all_batch_targets.append(batch_targets.clone())
-                model_optimizer.zero_grad()
-                if total_batches_processed >= config["warmup_number_of_batches"]:
-                    all_model_state_dicts.append({k: v.clone() for k, v in model.state_dict().items()})
-                out = model(batch_inputs)
-                y = F.mse_loss(out, batch_targets)
-                y.backward()
+                loss = loss.mean()
+                loss.backward()
 
-                if "defense_name" in config:
-                    # Apply gradient defenses
-                    gradients = [param.grad for param in model.parameters()]
-                    if "sign" in config:
-                        gradients = apply_sign_transformation(gradients)
-                    if "prune_rate" in config:
-                        gradients = apply_pruning(gradients, config["prune_rate"])
-                    if "dp_epsilon" in config:
-                        gradients = add_gaussian_noise(gradients, config["dp_epsilon"])
+                all_batch_inputs.append(batch[0].clone())
+                all_batch_targets.append(batch[1].clone())
+                grads = [
+                    (p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p))
+                    for p in model.parameters()
+                ]
+                all_model_gradients.append(grads)
 
-                    # Update model parameters with modified gradients
-                    for param, grad in zip(model.parameters(), gradients):
-                        param.grad = grad
-
-                if total_batches_processed >= config["warmup_number_of_batches"]:
-                    all_model_gradients.append([param.grad.clone() for param in model.parameters()])
-
-                model_optimizer.step()
-
-                if total_batches_processed >= config["warmup_number_of_batches"]:
-                    model_update = [
-                        (current - prev).clone()
-                        for current, prev in zip(model.state_dict().values(), all_model_state_dicts[-1].values())
-                    ]
-                    all_model_updates.append(model_update)
-
-                    if "evaluate_trained_model" in config and config["evaluate_trained_model"]:
-                        model_predictive_stats = evaluate_model(
-                            model=deepcopy(model),
-                            dataset=val_dataset,
-                            device=config["device"],
-                            name="model_predictive_stats",
-                        )
-                        self._log_metrics(model_predictive_stats, step=total_batches_processed + 1)
+                all_model_state_dicts.append({k: v.clone() for k, v in model.state_dict().items()})
 
                 total_batches_processed += 1  # Update the total number of batches processed
+                
+        else:
+            model_optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
+
+            total_batches_processed = 0  # Initialize total batch counter
+            total_batches_needed = config["warmup_number_of_batches"] + config["number_of_batches"]
+            val_dataset = ConcatSliceDataset(self.val_datasets)
+            while total_batches_processed < total_batches_needed:
+                for batch_inputs, batch_targets in tr_dataloader:
+                    if total_batches_processed >= total_batches_needed:
+                        break  # Exit if we've processed the total required batches
+                    if not config["update_model"] and total_batches_processed > 0:
+                        model.load_state_dict(all_model_state_dicts[0])
+
+                    print(config)
+                    if config["dataset"] == "realworld":
+                        batch_inputs, batch_targets = (
+                            batch_inputs[:, :, model.features].to(config["device"]),
+                            batch_targets[:].to(config["device"]),
+                        )
+                    else:
+                        batch_inputs, batch_targets = (
+                            batch_inputs[:, :, model.features].to(config["device"]),
+                            batch_targets[:, :, 0].to(config["device"]),
+                        )
+                    if total_batches_processed >= config["warmup_number_of_batches"]:
+                        all_batch_inputs.append(batch_inputs.clone())
+                        all_batch_targets.append(batch_targets.clone())
+                    model_optimizer.zero_grad()
+                    if total_batches_processed >= config["warmup_number_of_batches"]:
+                        all_model_state_dicts.append({k: v.clone() for k, v in model.state_dict().items()})
+                    out = model(batch_inputs)
+                    y = F.mse_loss(out, batch_targets)
+                    y.backward()
+
+                    if "defense_name" in config:
+                        # Apply gradient defenses
+                        gradients = [param.grad for param in model.parameters()]
+                        if "sign" in config:
+                            gradients = apply_sign_transformation(gradients)
+                        if "prune_rate" in config:
+                            gradients = apply_pruning(gradients, config["prune_rate"])
+                        if "dp_epsilon" in config:
+                            gradients = add_gaussian_noise(gradients, config["dp_epsilon"])
+
+                        # Update model parameters with modified gradients
+                        for param, grad in zip(model.parameters(), gradients):
+                            param.grad = grad
+
+                    if total_batches_processed >= config["warmup_number_of_batches"]:
+                        all_model_gradients.append([param.grad.clone() for param in model.parameters()])
+
+                    model_optimizer.step()
+
+                    if total_batches_processed >= config["warmup_number_of_batches"]:
+                        model_update = [
+                            (current - prev).clone()
+                            for current, prev in zip(model.state_dict().values(), all_model_state_dicts[-1].values())
+                        ]
+                        all_model_updates.append(model_update)
+
+                        if "evaluate_trained_model" in config and config["evaluate_trained_model"]:
+                            model_predictive_stats = evaluate_model(
+                                model=deepcopy(model),
+                                dataset=val_dataset,
+                                device=config["device"],
+                                name="model_predictive_stats",
+                            )
+                            self._log_metrics(model_predictive_stats, step=total_batches_processed + 1)
+
+                    total_batches_processed += 1  # Update the total number of batches processed
 
         return all_batch_inputs, all_batch_targets, all_model_state_dicts, all_model_gradients, all_model_updates
 
@@ -1070,44 +1165,62 @@ class AttackTSInverseWorker(Worker):
             # sample_mapping = self.get_batch_sample_mapping(batch_inputs, dummy_inputs)
             standard_mapping = np.arange(0, batch_inputs.shape[0])
             input_sample_mapping = get_batch_sample_mapping(batch_inputs, dummy_inputs)
-            target_sample_mapping = get_batch_sample_mapping(batch_targets, dummy_targets)
+            dataset_name = config["dataset"]
+            if dataset_name != 'realworld':
+                target_sample_mapping = get_batch_sample_mapping(batch_targets, dummy_targets)
 
             sample_mapping = np.arange(0, batch_inputs.shape[0])
             if not (standard_mapping == input_sample_mapping).all():
                 sample_mapping = input_sample_mapping
-            if (standard_mapping == input_sample_mapping).all() and not (standard_mapping == target_sample_mapping).all():
+            if dataset_name != 'realworld' and (standard_mapping == input_sample_mapping).all() and not (standard_mapping == target_sample_mapping).all():
                 sample_mapping = target_sample_mapping
             # if not (standard_mapping == input_sample_mapping).all() and not (standard_mapping == target_sample_mapping).all():
             #     if not (input_sample_mapping == target_sample_mapping).all():
             #         raise ValueError('Input and target sample mappings are not equal while being different from the standard mapping.')
 
-            mean_evaluation = {
-                "inputs/mse/mean": F.mse_loss(dummy_inputs[sample_mapping], batch_inputs).item(),
-                "targets/mse/mean": F.mse_loss(dummy_targets[sample_mapping], batch_targets).item(),
-                "inputs/rmse/mean": torch.sqrt(F.mse_loss(dummy_inputs[sample_mapping], batch_inputs)).item(),
-                "targets/rmse/mean": torch.sqrt(F.mse_loss(dummy_targets[sample_mapping], batch_targets)).item(),
-                "inputs/mae/mean": F.l1_loss(dummy_inputs[sample_mapping], batch_inputs).item(),
-                "targets/mae/mean": F.l1_loss(dummy_targets[sample_mapping], batch_targets).item(),
-                "inputs/smape/mean": SMAPELoss(dummy_inputs[sample_mapping], batch_inputs).item(),
-                "targets/smape/mean": SMAPELoss(dummy_targets[sample_mapping], batch_targets).item(),
-            }
+            if dataset_name == 'realworld':
+                mean_evaluation = {
+                    # "inputs/accuracy/mean": (dummy_inputs[sample_mapping].argmax(dim=-1) == batch_inputs.argmax(dim=-1)).float().mean().item(),
+                    "inputs/mae/mean": F.l1_loss(dummy_inputs[sample_mapping], batch_inputs).item(),
+                    "inputs/mse/mean": F.mse_loss(dummy_inputs[sample_mapping], batch_inputs).item(),
+                    "inputs/rmse/mean": torch.sqrt(F.mse_loss(dummy_inputs[sample_mapping], batch_inputs)).item(),
+                }
+            else:
+                mean_evaluation = {
+                    "inputs/mse/mean": F.mse_loss(dummy_inputs[sample_mapping], batch_inputs).item(),
+                    "targets/mse/mean": F.mse_loss(dummy_targets[sample_mapping], batch_targets).item(),
+                    "inputs/rmse/mean": torch.sqrt(F.mse_loss(dummy_inputs[sample_mapping], batch_inputs)).item(),
+                    "targets/rmse/mean": torch.sqrt(F.mse_loss(dummy_targets[sample_mapping], batch_targets)).item(),
+                    "inputs/mae/mean": F.l1_loss(dummy_inputs[sample_mapping], batch_inputs).item(),
+                    "targets/mae/mean": F.l1_loss(dummy_targets[sample_mapping], batch_targets).item(),
+                    "inputs/smape/mean": SMAPELoss(dummy_inputs[sample_mapping], batch_inputs).item(),
+                    "targets/smape/mean": SMAPELoss(dummy_targets[sample_mapping], batch_targets).item(),
+                }
             attack_metrics.update(mean_evaluation)
 
             # individual batch sample metrics
             for i, j in enumerate(sample_mapping):
-                individual_evaluation = {
-                    f"inputs/mse/{i}": F.mse_loss(dummy_inputs[j], batch_inputs[i]).item(),
-                    f"targets/mse/{i}": F.mse_loss(dummy_targets[j], batch_targets[i]).item(),
-                    f"inputs/rmse/{i}": torch.sqrt(F.mse_loss(dummy_inputs[j], batch_inputs[i])).item(),
-                    f"targets/rmse/{i}": torch.sqrt(F.mse_loss(dummy_targets[j], batch_targets[i])).item(),
-                    f"inputs/mae/{i}": F.l1_loss(dummy_inputs[j], batch_inputs[i]).item(),
-                    f"targets/mae/{i}": F.l1_loss(dummy_targets[j], batch_targets[i]).item(),
-                    f"inputs/smape/{i}": SMAPELoss(dummy_inputs[j], batch_inputs[i]).item(),
-                    f"targets/smape/{i}": SMAPELoss(dummy_targets[j], batch_targets[i]).item(),
-                }
+                if dataset_name == 'realworld':
+                    individual_evaluation = {
+                        # f"inputs/accuracy/{i}": (dummy_inputs[j].argmax(dim=-1) == batch_inputs[i].argmax(dim=-1)).float().mean().item(),
+                        f"inputs/mae/{i}": F.l1_loss(dummy_inputs[j], batch_inputs[i]).item(),
+                        f"inputs/mse/{i}": F.mse_loss(dummy_inputs[j], batch_inputs[i]).item(),
+                        f"inputs/rmse/{i}": torch.sqrt(F.mse_loss(dummy_inputs[j], batch_inputs[i])).item(),
+                    }
+                else:
+                    individual_evaluation = {
+                        f"inputs/mse/{i}": F.mse_loss(dummy_inputs[j], batch_inputs[i]).item(),
+                        f"targets/mse/{i}": F.mse_loss(dummy_targets[j], batch_targets[i]).item(),
+                        f"inputs/rmse/{i}": torch.sqrt(F.mse_loss(dummy_inputs[j], batch_inputs[i])).item(),
+                        f"targets/rmse/{i}": torch.sqrt(F.mse_loss(dummy_targets[j], batch_targets[i])).item(),
+                        f"inputs/mae/{i}": F.l1_loss(dummy_inputs[j], batch_inputs[i]).item(),
+                        f"targets/mae/{i}": F.l1_loss(dummy_targets[j], batch_targets[i]).item(),
+                        f"inputs/smape/{i}": SMAPELoss(dummy_inputs[j], batch_inputs[i]).item(),
+                        f"targets/smape/{i}": SMAPELoss(dummy_targets[j], batch_targets[i]).item(),
+                    }
                 attack_metrics.update(individual_evaluation)
 
-            if attack_step % (num_attack_steps // log_plots_n_times) == 0:
+            if dataset_name != 'realworld' and attack_step % (num_attack_steps // log_plots_n_times) == 0:
                 df, fig = plot_original_and_dummy_data(
                     config, sample_mapping, dummy_inputs, dummy_targets, batch_inputs, batch_targets
                 )

@@ -10,6 +10,71 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.ticker import FuncFormatter
 
+class IMUDataset(Dataset):
+    """ Load sentence pair (sequential or random order) from corpus """
+    def __init__(self, data, labels, pipeline=[]):
+        super().__init__()
+        self.pipeline = pipeline
+        self.data = data
+        self.labels = labels
+
+    def __getitem__(self, index):
+        instance = self.data[index]
+        for proc in self.pipeline:
+            instance = proc(instance)
+        return torch.from_numpy(instance).float(), torch.from_numpy(np.array(self.labels[index])).long()
+
+    def __len__(self):
+        return len(self.data)
+
+def get_har_dataset(
+    seq_len = 150,
+    dimension = 63,
+    user_label_size = 13,
+    test_user = [0],
+    data_path = '/scratch/ejk5818/ts-inverse/data/realworld/',
+    label_rate = 0.01
+):
+    train_data   = np.empty( [0, seq_len, dimension], dtype=float )
+    test_data    = np.empty( [0, seq_len, dimension], dtype=float )
+    train_label  = np.empty( [0], dtype=int )
+    test_label   = np.empty( [0], dtype=int )
+
+    for i in range(user_label_size):
+        data = np.load(data_path +  'sub_{}_data.npy'.format(i)).astype(np.float32)
+        label = np.load(data_path +  'sub_{}_label.npy'.format(i)).astype(np.float32)
+        if i in test_user:
+            test_data = np.concatenate( (test_data, data), axis=0 )
+            test_label = np.concatenate( (test_label, label), axis=0 )
+            print('user for test in finetune: user_{}'.format(i))
+        else:
+            train_data = np.concatenate( (train_data, data), axis=0 )
+            train_label = np.concatenate( (train_label, label), axis=0 )
+
+    def prepare_simple_dataset(data, labels, training_rate=0.2, val_rate=0.1):
+        arr = np.arange(data.shape[0])
+        np.random.shuffle(arr)
+        data = data[arr]
+        labels = labels[arr]
+        train_num = int(data.shape[0] * training_rate)
+        val_num = int(data.shape[0] * val_rate)
+        data_train = data[:train_num, ...]
+        data_val = data[train_num:train_num+val_num, ...]
+        data_test = data[train_num+val_num:, ...]
+        t = np.min(labels)
+        label_train = labels[:train_num] - t
+        label_val = labels[train_num:train_num+val_num] - t
+        label_test = labels[train_num+val_num:] - t
+
+        return data_train, label_train, data_val, label_val, data_test, label_test
+
+    data_train, label_train, data_valid, label_valid, data_test, label_test = prepare_simple_dataset(train_data, train_label, training_rate=0.9)
+    data_train_labeled, label_train_labeled, _, _, data_train_unlabeled, label_train_unlabeled = prepare_simple_dataset(data_train, label_train, training_rate=label_rate, val_rate=0.0)
+
+    data_set_train = IMUDataset(data_train_unlabeled, label_train_unlabeled)
+    data_set_valid = IMUDataset(data_valid, label_valid)
+    data_set_test  = IMUDataset(data_test, label_test)
+    return [data_set_train], [data_set_valid], [data_set_test]
 
 class TimeSeriesDataSet(Dataset):
     """

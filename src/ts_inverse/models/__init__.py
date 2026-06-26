@@ -4,6 +4,7 @@ from .lstm import LSTM_Predictor, StackedLSTM_Predictor, CNNLSTM_Predictor
 from .gru import GRU_Predictor, StackedGRU_Predictor, CNNGRU_Predictor
 from .jit_gru import JitGRU_Predictor, CNNJitGRU_Predictor, JitSeq2Seq_Predictor
 from .tcn import TCN_Predictor
+from .stmae import STMAE_Pre, STMAE_Finetune, RealWorldCNN
 from .grad_to_input import (
     GradToInputNN,
     ImprovedGradToInputNN,
