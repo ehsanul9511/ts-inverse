@@ -268,7 +268,7 @@ attack_config = [
 dataset_config = [
     {
         "dataset": "motionsense",
-        "data_path": "/scratch/ejk5818/motion-sense/data/",
+        "data_path": "/scratch/ejk5818/ts-inverse/data/motion-sense/",
         "seq_len": 50,
         "stride": 10,
         "num_features": 12,
