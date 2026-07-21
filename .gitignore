@@ -22,3 +22,7 @@ data/*/*.txt
 data/*
 *.txt
 media/*
+
+reconstructions/*
+*.npz
+ideal_household_scripts/*

@@ -29,8 +29,18 @@ from ts_inverse.models import GradToInputNN, ImprovedGradToInputNN_Probabilistic
 from ts_inverse.utils import set_seed, seed_worker
 # from .attack_worker import AttackWorker, plot_original_and_dummy_data
 from .worker import Worker
-from ts_inverse.datahandler import ConcatSliceDataset, get_mean_std_dataloader, get_har_dataset
+from ts_inverse.datahandler import (
+    ConcatSliceDataset,
+    get_mean_std_dataloader,
+    get_har_dataset,
+    get_motionsense_dataset,
+)
 from .forecasting_worker import evaluate_model
+
+CLASSIFICATION_DATASETS = {
+    "realworld",
+    "motionsense",
+}
 
 
 class AttackTSInverseWorker(Worker):
@@ -41,21 +51,39 @@ class AttackTSInverseWorker(Worker):
     def _init_attack_worker_process(self, c, d_c, m_c, fam_c, def_c=None):
         final_model_settings = {**m_c, **fam_c}
         dataset_name = d_c["dataset"]
+
         if dataset_name == "realworld":
-            self.train_datasets, self.val_datasets, self.test_datasets = get_har_dataset()
-            print("Loaded realworld HAR dataset")
-            # import sys; sys.exit(0)
+            self.train_datasets, self.val_datasets, self.test_datasets = (
+                get_har_dataset()
+            )
+            print("Loaded RealWorld HAR dataset")
+
+        elif dataset_name == "motionsense":
+            self.train_datasets, self.val_datasets, self.test_datasets = (
+                get_motionsense_dataset(
+                    data_path=d_c["data_path"],
+                    seq_len=d_c.get("seq_len", 50),
+                    stride=d_c.get("stride", 10),
+                    seed=c["seed"],
+                )
+            )
+            print("Loaded MotionSense activity dataset")
+
         else:
-            self.train_datasets, self.val_datasets, self.test_datasets = self.get_datasets(**d_c)
+            self.train_datasets, self.val_datasets, self.test_datasets = (
+                self.get_datasets(**d_c)
+            )
         self.g = set_seed(c["seed"])
 
         # if dataset == "realworld":
         #     train_dataloader = DataLoader(self.train_datasets, shuffle=True, batch_size=c["batch_size"], worker_init_fn=seed_worker, generator=self.g)
-        if dataset_name == "realworld":
+        if dataset_name in CLASSIFICATION_DATASETS:
             train_dataloader = DataLoader(
                 ConcatDataset(self.train_datasets),
                 batch_size=c["batch_size"],
-                shuffle=True
+                shuffle=(dataset_name != "motionsense"),
+                worker_init_fn=seed_worker,
+                generator=self.g,
             )
         else:
             train_dataloader = DataLoader(
@@ -66,8 +94,13 @@ class AttackTSInverseWorker(Worker):
                 generator=self.g,
             )
 
+        if dataset_name in CLASSIFICATION_DATASETS:
+            mean_std_dataset = ConcatDataset(self.train_datasets)
+        else:
+            mean_std_dataset = ConcatSliceDataset(self.train_datasets)
+
         mean_std_dataloader = DataLoader(
-            ConcatSliceDataset(self.train_datasets),
+            mean_std_dataset,
             batch_size=c["batch_size"],
             shuffle=True,
             worker_init_fn=seed_worker,
@@ -79,23 +112,29 @@ class AttackTSInverseWorker(Worker):
 
         if dataset_name == "realworld":
             model = final_model_settings["_model"]()
-            # model = final_model_settings["_model"](embed_dim=128, depth=5, num_heads=2, mlp_ratio=1, 
-            #             norm_layer=nn.LayerNorm, node_dim=9, window_size=150, node_num=7,
-            #             decoder_embed_dim=64, decoder_depth=1, decoder_num_heads=1,
-            #             mask_ratio=0.5, len_mask=1)
-            # model = final_model_settings["_model"](embed_dim=128, depth=5, 
-            #             num_heads=2, mlp_ratio=1,
-            #             norm_layer=nn.LayerNorm, node_dim=9, window_size=150, node_num=7, num_classes=8)
+
+        elif dataset_name == "motionsense":
+            model = final_model_settings["_model"](
+                num_features=d_c.get("num_features", 12),
+                window_size=d_c.get("seq_len", 50),
+                num_classes=d_c.get("num_classes", 4),
+            )
+
         else:
             freq_in_day = self.train_datasets[0].freq_in_day
-            model_settings = {key: value for key, value in final_model_settings.items() if not key.startswith("_")}
+
+            model_settings = {
+                key: value
+                for key, value in final_model_settings.items()
+                if not key.startswith("_")
+            }
+
             for key, value in model_settings.items():
                 if key.startswith("input_") or key.startswith("output_"):
                     model_settings[key] = value * freq_in_day
                     final_model_settings[key] = value * freq_in_day
 
-            model = final_model_settings["_model"](**model_settings)  # Create model
-
+            model = final_model_settings["_model"](**model_settings)
             final_model_settings.update(model.extra_info)
 
         final_config = {**c, **d_c, **final_model_settings}
@@ -135,14 +174,35 @@ class AttackTSInverseWorker(Worker):
             self.train_model_and_record(model, tr_dataloader, config)
         )
 
-        self.all_dummy_inputs, self.all_dummy_targets = self.generate_dummy_data(
-            self.all_batch_inputs[0], self.all_batch_targets[0], config
-        )
+        number_of_attacks = config["attack_number_of_batches"]
+
+        if number_of_attacks > len(self.all_batch_inputs):
+            raise ValueError(
+                f"Requested {number_of_attacks} attacks, but only "
+                f"{len(self.all_batch_inputs)} gradient batches were recorded. "
+                "Set number_of_batches >= attack_number_of_batches."
+            )
+
+        self.all_dummy_inputs = []
+        self.all_dummy_targets = []
+
+        for batch_number in range(number_of_attacks):
+            single_batch_config = dict(config)
+            single_batch_config["attack_number_of_batches"] = 1
+
+            dummy_inputs, dummy_targets = self.generate_dummy_data(
+                self.all_batch_inputs[batch_number],
+                self.all_batch_targets[batch_number],
+                single_batch_config,
+            )
+
+            self.all_dummy_inputs.append(dummy_inputs[0])
+            self.all_dummy_targets.append(dummy_targets[0])
 
         dataset_name = config["dataset"]
-        if dataset_name != "realworld":
+        if dataset_name not in CLASSIFICATION_DATASETS:
             self.inputs_mean, self.inputs_std = self.inputs_mean[model.features], self.inputs_std[model.features]
-        self.targets_mean, self.targets_std = self.targets_mean[0], self.targets_std[0]
+            self.targets_mean, self.targets_std = self.targets_mean[0], self.targets_std[0]
         config["model_size"] = sum(p.numel() for p in model.parameters())
 
         if "aux_dataset" in config and config["aux_dataset"] is not None:
@@ -163,7 +223,7 @@ class AttackTSInverseWorker(Worker):
             aux_valset = ConcatDataset(self.val_datasets)
 
         # Prior knowledge datasets
-        if dataset_name == "realworld":
+        if dataset_name in CLASSIFICATION_DATASETS:
             self.auxiliary_train_dataloader = DataLoader(
                 aux_trainset, batch_size=128, shuffle=False
             )
@@ -193,6 +253,16 @@ class AttackTSInverseWorker(Worker):
             print("Length of dataloader:", len(self.aux_gi_t_dataloader))
 
     def start_attack(self, model, config):
+        number_of_attacks = config["attack_number_of_batches"]
+        number_of_recorded_batches = len(self.all_model_state_dicts)
+
+        if number_of_attacks > number_of_recorded_batches:
+            raise ValueError(
+                f"attack_number_of_batches={number_of_attacks}, but only "
+                f"{number_of_recorded_batches} batches were recorded. "
+                "Increase number_of_batches."
+            )
+        
         for batch_number in range(config["attack_number_of_batches"]):
             model.load_state_dict(self.all_model_state_dicts[batch_number])
             original_dy_dx = self.all_model_gradients[batch_number]
@@ -352,11 +422,12 @@ class AttackTSInverseWorker(Worker):
                 dummy_targets = regularization_targets.detach().clone().requires_grad_(True)
 
         optimization_space = [dummy_inputs]
-        if config["batch_size"] > 1 or not config["one_shot_targets"]:
-            optimization_space += [dummy_targets]
-        if "TCN" in model.name and config["optimize_dropout"] and config["dropout"] > 0:
-            dropout_masks = model.init_dropout_masks(config["device"], config["dropout_mask_init_type"])
-            optimization_space += dropout_masks
+
+        if config["attack_targets"] and (
+            config["batch_size"] > 1
+            or not config["one_shot_targets"]
+        ):
+            optimization_space.append(dummy_targets)
 
         dummy_optimizer, dummy_schedular = self.set_attack_optimizer_and_schedular(
             optimization_space,
@@ -367,7 +438,7 @@ class AttackTSInverseWorker(Worker):
         )
 
         sample_mapping = np.arange(0, batch_inputs.shape[0])
-        if config["dataset"] != "realworld":
+        if config["dataset"] not in CLASSIFICATION_DATASETS:
             plot_original_and_dummy_data(config, sample_mapping, dummy_inputs, dummy_targets, batch_inputs, batch_targets)
 
         for attack_step in range(0, config["num_attack_steps"] + 1):
@@ -385,10 +456,16 @@ class AttackTSInverseWorker(Worker):
                 # print(f"len(dummy_out): {len(dummy_out)}")
                 # print(f"dummy_out item shapes: {[dummy_out_i.shape for dummy_out_i in dummy_out]}")
                 # print(f"dummy_targets shape: {dummy_targets.shape}")
-                if config["dataset"] == "realworld":
-                    dummy_y = nn.CrossEntropyLoss()(dummy_out, dummy_targets)
+                if config["dataset"] in CLASSIFICATION_DATASETS:
+                    dummy_y = nn.CrossEntropyLoss()(
+                        dummy_out,
+                        dummy_targets,
+                    )
                 else:
-                    dummy_y = F.mse_loss(dummy_out, dummy_targets)
+                    dummy_y = F.mse_loss(
+                        dummy_out,
+                        dummy_targets,
+                    )
                 dummy_dy_dx = torch.autograd.grad(dummy_y, model.parameters(), create_graph=True)
 
                 if attack_step >= config["num_attack_steps"]:
@@ -421,12 +498,16 @@ class AttackTSInverseWorker(Worker):
 
                 if "total_variation_alpha_inputs" in config and config["total_variation_alpha_inputs"] > 0:
                     dy_dx_loss += config["total_variation_alpha_inputs"] * total_variation_time_series(dummy_inputs)
-                if "total_variation_beta_targets" in config and config["total_variation_beta_targets"] > 0:
+                if (
+                    config["dataset"] not in CLASSIFICATION_DATASETS
+                    and "total_variation_beta_targets" in config
+                    and config["total_variation_beta_targets"] > 0
+                ):
                     dy_dx_loss += config["total_variation_beta_targets"] * total_variation_time_series(
                         dummy_targets.unsqueeze(-1)
                     )
 
-                if config["dataset"] != "realworld":
+                if config["dataset"] not in CLASSIFICATION_DATASETS:
                     combined_dummy_data_first_feature = torch.cat([dummy_inputs[:, :, 0], dummy_targets[:, :]], dim=1)  # Same series
                     if "lower_res_term_inputs" in config and config["lower_res_term_inputs"] > 0:
                         with torch.no_grad():
@@ -504,6 +585,58 @@ class AttackTSInverseWorker(Worker):
                     attack_metrics,
                     attack_step_offset=config["num_learn_epochs"],
                 )
+
+        if config["dataset"] == "motionsense":
+            # Match reconstructed samples to the order of the original batch.
+            final_mapping = get_batch_sample_mapping(
+                batch_inputs,
+                dummy_inputs,
+            )
+
+            reconstructed_data = (
+                dummy_inputs[final_mapping]
+                .detach()
+                .cpu()
+            )
+
+            corresponding_genders = (
+                self.all_batch_genders[batch_number]
+                .detach()
+                .cpu()
+            )
+
+            output_directory = config.get(
+                "reconstruction_output_dir",
+                "../data/_reconstructions",
+            )
+
+            os.makedirs(
+                output_directory,
+                exist_ok=True,
+            )
+
+            output_path = os.path.join(
+                output_directory,
+                (
+                    f"motionsense_reconstruction_"
+                    f"run_{config['run_number']}_"
+                    f"batch_{batch_number}.pt"
+                ),
+            )
+
+            torch.save(
+                {
+                    "reconstructed_data": reconstructed_data,
+                    "gender": corresponding_genders,
+                },
+                output_path,
+            )
+
+            print(
+                "Saved reconstructed data and gender:",
+                output_path,
+            )
+
 
     def learned_prior_regularization(self, dummy_inputs, dummy_targets, regularization_inputs, regularization_targets, config):
         learned_prior_regularization = torch.zeros(1, device=dummy_inputs.device)
@@ -882,14 +1015,20 @@ class AttackTSInverseWorker(Worker):
                 torch.rand_like(batch_input_example, device=config["device"], requires_grad=True)
                 for _ in range(attack_number_of_batches)
             ]
-            if config["dataset"] == "realworld":
+            
+            if config["dataset"] in CLASSIFICATION_DATASETS:
+                # Minimal classification attack: the activity label is known.
                 all_dummy_targets = [
-                    torch.randint(low=0, high=8, size=batch_target_example.shape, device=config["device"]).long()
+                    batch_target_example.detach().clone().to(config["device"])
                     for _ in range(attack_number_of_batches)
                 ]
             else:
                 all_dummy_targets = [
-                    torch.rand_like(batch_target_example, device=config["device"], requires_grad=True)
+                    torch.rand_like(
+                        batch_target_example,
+                        device=config["device"],
+                        requires_grad=True,
+                    )
                     for _ in range(attack_number_of_batches)
                 ]
         elif config["dummy_init_method"] == "halves":
@@ -935,43 +1074,120 @@ class AttackTSInverseWorker(Worker):
         return all_dummy_inputs, all_dummy_targets
 
     def train_model_and_record(self, model, tr_dataloader, config):
+        self.all_batch_genders = []
         dataset = config["dataset"]
         model.to(config["device"])
         all_batch_inputs, all_batch_targets, all_model_state_dicts, all_model_gradients, all_model_updates = [], [], [], [], []
-        if dataset == 'realworld':
-            optimizer = torch.optim.Adam(params=model.parameters(), lr=0.005)
-            total_batches_processed = 0  # Initialize total batch counter
-            total_batches_needed = config["warmup_number_of_batches"] + config["number_of_batches"]
+        if dataset in CLASSIFICATION_DATASETS:
+            model_train_loader = DataLoader(
+                tr_dataloader.dataset,
+                batch_size=config.get("model_train_batch_size", 64),
+                shuffle=True,
+                worker_init_fn=seed_worker,
+                generator=self.g,
+            )
 
-            def func_loss(model, batch):
-                inputs, label = batch
-                logits = model(inputs)
-                loss = nn.CrossEntropyLoss()(logits, label)
-                return loss
-            
-            model.train()
-            for _, batch in enumerate(tr_dataloader):
+            optimizer = torch.optim.Adam(
+                model.parameters(),
+                lr=config.get("model_train_learning_rate", 1e-3),
+            )
+
+            loss_function = nn.CrossEntropyLoss()
+
+            # Train the activity classifier.
+            for epoch in range(config.get("model_train_epochs", 20)):
+                model.train()
+
+                epoch_loss = 0.0
+                epoch_correct = 0
+                epoch_samples = 0
+
+                for inputs, labels in model_train_loader:
+                    inputs = inputs.to(config["device"])
+                    labels = labels.to(config["device"])
+
+                    optimizer.zero_grad()
+
+                    logits = model(inputs)
+                    loss = loss_function(logits, labels)
+
+                    loss.backward()
+                    optimizer.step()
+
+                    epoch_loss += loss.item() * len(labels)
+                    epoch_correct += (
+                        logits.argmax(dim=1) == labels
+                    ).sum().item()
+                    epoch_samples += len(labels)
+
+                print(
+                    f"Activity epoch {epoch + 1:02d}/"
+                    f"{config.get('model_train_epochs', 20)} | "
+                    f"loss {epoch_loss / epoch_samples:.4f} | "
+                    f"accuracy {epoch_correct / epoch_samples:.4f}"
+                )
+
+            # Disable dropout while recording and reconstructing the gradient.
+            # Otherwise the original and dummy passes would use different masks.
+            model.eval()
+
+            sample_offset = 0
+
+            total_batches_processed = 0
+            total_batches_needed = config["number_of_batches"]
+
+            for inputs, labels in tr_dataloader:
                 if total_batches_processed >= total_batches_needed:
                     break
-                batch = [t.to(config["device"]) for t in batch]
-                optimizer.zero_grad()
-                loss = func_loss(model, batch)  
 
-                loss = loss.mean()
+                inputs = inputs.to(config["device"])
+                labels = labels.to(config["device"])
+
+                batch_size = inputs.shape[0]
+
+                if dataset == "motionsense":
+                    batch_genders = self.train_datasets[0].genders[
+                        sample_offset : sample_offset + batch_size
+                    ]
+
+                    batch_genders = torch.as_tensor(
+                        batch_genders,
+                        dtype=torch.long,
+                    )
+
+                    self.all_batch_genders.append(batch_genders)
+
+                sample_offset += batch_size
+
+                model.zero_grad(set_to_none=True)
+
+                logits = model(inputs)
+                loss = loss_function(logits, labels)
                 loss.backward()
 
-                all_batch_inputs.append(batch[0].clone())
-                all_batch_targets.append(batch[1].clone())
-                grads = [
-                    (p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p))
-                    for p in model.parameters()
-                ]
-                all_model_gradients.append(grads)
+                all_batch_inputs.append(inputs.detach().clone())
+                all_batch_targets.append(labels.detach().clone())
 
-                all_model_state_dicts.append({k: v.clone() for k, v in model.state_dict().items()})
+                all_model_state_dicts.append(
+                    {
+                        key: value.detach().clone()
+                        for key, value in model.state_dict().items()
+                    }
+                )
 
-                total_batches_processed += 1  # Update the total number of batches processed
-                
+                all_model_gradients.append(
+                    [
+                        parameter.grad.detach().clone()
+                        if parameter.grad is not None
+                        else torch.zeros_like(parameter)
+                        for parameter in model.parameters()
+                    ]
+                )
+
+                if config["update_model"]:
+                    optimizer.step()
+
+                total_batches_processed += 1
         else:
             model_optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
 
@@ -1166,24 +1382,38 @@ class AttackTSInverseWorker(Worker):
             standard_mapping = np.arange(0, batch_inputs.shape[0])
             input_sample_mapping = get_batch_sample_mapping(batch_inputs, dummy_inputs)
             dataset_name = config["dataset"]
-            if dataset_name != 'realworld':
+            if dataset_name not in CLASSIFICATION_DATASETS:
                 target_sample_mapping = get_batch_sample_mapping(batch_targets, dummy_targets)
 
             sample_mapping = np.arange(0, batch_inputs.shape[0])
             if not (standard_mapping == input_sample_mapping).all():
                 sample_mapping = input_sample_mapping
-            if dataset_name != 'realworld' and (standard_mapping == input_sample_mapping).all() and not (standard_mapping == target_sample_mapping).all():
+            if (
+                dataset_name not in CLASSIFICATION_DATASETS
+                and (standard_mapping == input_sample_mapping).all()
+                and not (standard_mapping == target_sample_mapping).all()
+            ):
                 sample_mapping = target_sample_mapping
             # if not (standard_mapping == input_sample_mapping).all() and not (standard_mapping == target_sample_mapping).all():
             #     if not (input_sample_mapping == target_sample_mapping).all():
             #         raise ValueError('Input and target sample mappings are not equal while being different from the standard mapping.')
 
-            if dataset_name == 'realworld':
+            if dataset_name in CLASSIFICATION_DATASETS:
                 mean_evaluation = {
-                    # "inputs/accuracy/mean": (dummy_inputs[sample_mapping].argmax(dim=-1) == batch_inputs.argmax(dim=-1)).float().mean().item(),
-                    "inputs/mae/mean": F.l1_loss(dummy_inputs[sample_mapping], batch_inputs).item(),
-                    "inputs/mse/mean": F.mse_loss(dummy_inputs[sample_mapping], batch_inputs).item(),
-                    "inputs/rmse/mean": torch.sqrt(F.mse_loss(dummy_inputs[sample_mapping], batch_inputs)).item(),
+                    "inputs/mae/mean": F.l1_loss(
+                        dummy_inputs[sample_mapping],
+                        batch_inputs,
+                    ).item(),
+                    "inputs/mse/mean": F.mse_loss(
+                        dummy_inputs[sample_mapping],
+                        batch_inputs,
+                    ).item(),
+                    "inputs/rmse/mean": torch.sqrt(
+                        F.mse_loss(
+                            dummy_inputs[sample_mapping],
+                            batch_inputs,
+                        )
+                    ).item(),
                 }
             else:
                 mean_evaluation = {
@@ -1200,7 +1430,7 @@ class AttackTSInverseWorker(Worker):
 
             # individual batch sample metrics
             for i, j in enumerate(sample_mapping):
-                if dataset_name == 'realworld':
+                if dataset_name in CLASSIFICATION_DATASETS:
                     individual_evaluation = {
                         # f"inputs/accuracy/{i}": (dummy_inputs[j].argmax(dim=-1) == batch_inputs[i].argmax(dim=-1)).float().mean().item(),
                         f"inputs/mae/{i}": F.l1_loss(dummy_inputs[j], batch_inputs[i]).item(),
@@ -1220,7 +1450,7 @@ class AttackTSInverseWorker(Worker):
                     }
                 attack_metrics.update(individual_evaluation)
 
-            if dataset_name != 'realworld' and attack_step % (num_attack_steps // log_plots_n_times) == 0:
+            if dataset_name not in CLASSIFICATION_DATASETS and attack_step % (num_attack_steps // log_plots_n_times) == 0:
                 df, fig = plot_original_and_dummy_data(
                     config, sample_mapping, dummy_inputs, dummy_targets, batch_inputs, batch_targets
                 )
@@ -1290,8 +1520,18 @@ class AttackTSInverseWorker(Worker):
                 dummy_targets.data = torch.clamp(dummy_targets, 0, 1)
             if "clamp_2" in config["after_effect"]:
                 if attack_step % 2 == 0:
-                    dummy_inputs.data = torch.clamp(dummy_inputs, 0, 1)
-                    dummy_targets.data = torch.clamp(dummy_targets, 0, 1)
+                    dummy_inputs.data = torch.clamp(
+                        dummy_inputs,
+                        0,
+                        1,
+                    )
+
+                    if config["dataset"] not in CLASSIFICATION_DATASETS:
+                        dummy_targets.data = torch.clamp(
+                            dummy_targets,
+                            0,
+                            1,
+                        )
             if "clamp_min0_2" in config["after_effect"]:
                 if attack_step % 2 == 0:
                     dummy_inputs.data = torch.clamp(dummy_inputs, 0)

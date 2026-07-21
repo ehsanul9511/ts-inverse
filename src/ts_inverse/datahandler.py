@@ -10,13 +10,205 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.ticker import FuncFormatter
 
+from pathlib import Path
+
+MOTIONSENSE_ACTIVITY_CODES = {
+    "dws": 0,
+    "ups": 1,
+    "wlk": 2,
+    "jog": 3,
+}
+
+MOTIONSENSE_TRIAL_CODES = {
+    "dws": [1, 2, 11],
+    "ups": [3, 4, 12],
+    "wlk": [7, 8, 15],
+    "jog": [9, 16],
+}
+
+
+def get_motionsense_dataset(
+    data_path="/scratch/ejk5818/motion-sense/data/",
+    seq_len=50,
+    stride=10,
+    validation_rate=0.1,
+    seed=43,
+):
+    """
+    Load MotionSense for four-class activity recognition.
+
+    Input shape:
+        [number_of_windows, seq_len, 12]
+
+    Labels:
+        0 = downstairs
+        1 = upstairs
+        2 = walking
+        3 = jogging
+
+    Split:
+        trials <= 10: training
+        trials > 10: testing
+    """
+
+    root = Path(data_path)
+    subject_info_path = root / "data_subjects_info.csv"
+    motion_root = root / "A_DeviceMotion_data"
+
+    subject_info = pd.read_csv(subject_info_path)
+    subject_ids = subject_info.iloc[:, 0].astype(int).tolist()
+
+    subject_genders = {
+        int(row.iloc[0]): int(row.iloc[4])
+        for _, row in subject_info.iterrows()
+    }
+
+    train_recordings = []
+    test_recordings = []
+
+    for subject_id in subject_ids:
+        for activity, label in MOTIONSENSE_ACTIVITY_CODES.items():
+            for trial in MOTIONSENSE_TRIAL_CODES[activity]:
+                path = (
+                    motion_root
+                    / f"{activity}_{trial}"
+                    / f"sub_{subject_id}.csv"
+                )
+
+                frame = pd.read_csv(path)
+
+                # Remove the CSV index column.
+                frame = frame.loc[
+                    :,
+                    ~frame.columns.str.lower().str.startswith("unnamed"),
+                ]
+
+                data = frame.to_numpy(dtype=np.float32)
+
+                if data.shape[1] != 12:
+                    raise ValueError(
+                        f"Expected 12 sensor features in {path}, "
+                        f"but found {data.shape[1]}"
+                    )
+                
+                gender = subject_genders[subject_id]
+
+                recording = (
+                    data,
+                    label,
+                    subject_id,
+                    gender,
+                )
+
+                if trial > 10:
+                    test_recordings.append(recording)
+                else:
+                    train_recordings.append(recording)
+
+    # Fit standardization on raw training samples only.
+    total = np.zeros(12, dtype=np.float64)
+    total_squared = np.zeros(12, dtype=np.float64)
+    sample_count = 0
+
+    for data, *_ in train_recordings:
+        data64 = data.astype(np.float64)
+        total += data64.sum(axis=0)
+        total_squared += np.square(data64).sum(axis=0)
+        sample_count += len(data64)
+
+    train_mean = total / sample_count
+    train_variance = np.maximum(
+        total_squared / sample_count - np.square(train_mean),
+        0.0,
+    )
+    train_std = np.sqrt(train_variance)
+    train_std[train_std < 1e-8] = 1.0
+
+    train_mean = train_mean.astype(np.float32)
+    train_std = train_std.astype(np.float32)
+
+    def make_windows(recordings):
+        windows = []
+        labels = []
+        genders = []
+
+        for data, activity_label, subject_id, gender in recordings:
+            data = (data - train_mean) / train_std
+
+            for start in range(
+                0,
+                len(data) - seq_len + 1,
+                stride,
+            ):
+                windows.append(
+                    data[start : start + seq_len]
+                )
+                labels.append(activity_label)
+                genders.append(gender)
+
+        return (
+            np.stack(windows).astype(np.float32),
+            np.asarray(labels, dtype=np.int64),
+            np.asarray(genders, dtype=np.int64),
+        )
+
+    train_data, train_labels, train_genders = make_windows(
+        train_recordings
+    )
+
+    test_data, test_labels, test_genders = make_windows(
+        test_recordings
+    )
+
+    # The original notebook has train/test but no validation split.
+    # This small validation portion supports the existing attack pipeline.
+    rng = np.random.default_rng(seed)
+    permutation = rng.permutation(len(train_data))
+
+    validation_size = max(
+        1,
+        int(len(train_data) * validation_rate),
+    )
+
+    validation_indices = permutation[:validation_size]
+    final_train_indices = permutation[validation_size:]
+
+    validation_data = train_data[validation_indices]
+    validation_labels = train_labels[validation_indices]
+
+    train_data = train_data[final_train_indices]
+    train_labels = train_labels[final_train_indices]
+
+    validation_genders = train_genders[validation_indices]
+    train_genders = train_genders[final_train_indices]
+
+    train_dataset = IMUDataset(train_data, train_labels, genders=train_genders)
+    validation_dataset = IMUDataset(
+        validation_data,
+        validation_labels,
+        genders=validation_genders,
+    )
+    test_dataset = IMUDataset(test_data, test_labels, genders=test_genders)
+
+    print("MotionSense training windows:", train_data.shape)
+    print("MotionSense validation windows:", validation_data.shape)
+    print("MotionSense test windows:", test_data.shape)
+
+    return [train_dataset], [validation_dataset], [test_dataset]
+
 class IMUDataset(Dataset):
-    """ Load sentence pair (sequential or random order) from corpus """
-    def __init__(self, data, labels, pipeline=[]):
+    def __init__(
+        self,
+        data,
+        labels,
+        pipeline=[],
+        genders=None,
+    ):
         super().__init__()
         self.pipeline = pipeline
         self.data = data
         self.labels = labels
+        self.genders = genders
 
     def __getitem__(self, index):
         instance = self.data[index]
