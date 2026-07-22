@@ -6,6 +6,14 @@ import torch
 import torch.nn as nn
 import psutil
 
+import os
+username = os.getenv("USER")
+
+data_path_dict = {
+    "ejk5818": "/scratch/ejk5818/ts-inverse/data/motion-sense/",
+    "ddl5280": "/scratch/ddl5280/ts-inverse/data/",
+}
+
 class MotionSenseActivityCNN(nn.Module):
     """
     Activity-only PyTorch version of the MTCNN architecture used in
@@ -138,7 +146,7 @@ print(f"Percentage: {svmem.percent}%")
 print("Distributed PyTorch available:", torch.distributed.is_available())
 
 from copy import deepcopy
-from ts_inverse.models import FCN_Predictor, CNN_Predictor, GRU_Predictor, JitGRU_Predictor, CNNJitGRU_Predictor, TCN_Predictor, JitSeq2Seq_Predictor, STMAE_Pre, STMAE_Finetune, RealWorldCNN
+from ts_inverse.models import FCN_Predictor, CNN_Predictor, GRU_Predictor, JitGRU_Predictor, CNNJitGRU_Predictor, TCN_Predictor, JitSeq2Seq_Predictor
 from ts_inverse.utils import grid_search_params
 from ts_inverse.workers import AttackTSInverseWorker
 
@@ -195,7 +203,7 @@ global_config = {
     'total_variation_beta_targets': 0,
     'after_effect': 'none',
     'warmup_number_of_batches': 0,
-    'number_of_batches': 1,
+    'number_of_batches': 20,
     'update_model': False, # Update the model in generating gradients from training data
     'model_evaluation_during_attack': False, # Baselines do not consider this
     'load_lti_model': False,
@@ -262,14 +270,15 @@ attack_config = [
         'grad_signs_for_targets': False,
         'grad_signs_for_dropouts': True, #[False, True],
 
-        'attack_number_of_batches': 1,
+        'attack_number_of_batches': 20,
     },
 ]
 
 dataset_config = [
     {
         "dataset": "motionsense",
-        "data_path": "/scratch/ejk5818/ts-inverse/data/motion-sense/",
+        # "data_path": "/scratch/ejk5818/ts-inverse/data/motion-sense/",
+        "data_path": data_path_dict[username] if username in data_path_dict else None,
         "seq_len": 50,
         "stride": 10,
         "num_features": 12,

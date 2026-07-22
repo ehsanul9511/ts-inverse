@@ -28,7 +28,7 @@ MOTIONSENSE_TRIAL_CODES = {
 
 
 def get_motionsense_dataset(
-    data_path="/scratch/ejk5818/ts-inverse/data/motion-sense/",
+    data_path=None,
     seq_len=50,
     stride=10,
     validation_rate=0.1,
@@ -50,6 +50,8 @@ def get_motionsense_dataset(
         trials <= 10: training
         trials > 10: testing
     """
+    if data_path is None:
+        raise ValueError("data_path must be specified for MotionSense dataset.")
 
     root = Path(data_path)
     subject_info_path = root / "data_subjects_info.csv"

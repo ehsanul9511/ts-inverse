@@ -275,6 +275,8 @@ class AttackTSInverseWorker(Worker):
                 model, config, batch_number, original_dy_dx, dummy_inputs, dummy_targets, batch_inputs, batch_targets
             )
 
+        self.log_aggregate_reconstruction_metrics(config)
+
         if config["device"] != "cpu":
             torch.cuda.empty_cache()
 
@@ -663,6 +665,13 @@ class AttackTSInverseWorker(Worker):
                     attack_metrics,
                     attack_step_offset=config["num_learn_epochs"],
                 )
+
+        self.all_dummy_inputs[batch_number] = (
+            dummy_inputs.detach().clone()
+        )
+        self.all_dummy_targets[batch_number] = (
+            dummy_targets.detach().clone()
+        )
 
         if config["dataset"] == "motionsense":
             # Match reconstructed samples to the order of the original batch.
@@ -1456,6 +1465,218 @@ class AttackTSInverseWorker(Worker):
             dy_dx_loss += cosine_weight * cosine_dia()
 
         return dy_dx_loss
+
+    def log_aggregate_reconstruction_metrics(self, config):
+        """Log final reconstruction errors across every attacked batch.
+
+        Input MAE and MSE are calculated over all reconstructed tensor
+        elements. Therefore, batches of different sizes are handled correctly.
+
+        For forecasting datasets, target metrics are also aggregated.
+        Classification targets are known labels and are therefore ignored.
+        """
+        number_of_attacks = config["attack_number_of_batches"]
+
+        if number_of_attacks <= 0:
+            return
+
+        input_absolute_error_sum = 0.0
+        input_squared_error_sum = 0.0
+        input_element_count = 0
+        input_batch_maes = []
+
+        target_absolute_error_sum = 0.0
+        target_squared_error_sum = 0.0
+        target_element_count = 0
+        target_smape_weighted_sum = 0.0
+        target_batch_maes = []
+
+        input_smape_weighted_sum = 0.0
+        total_samples = 0
+
+        with torch.no_grad():
+            for batch_number in range(number_of_attacks):
+                batch_inputs = self.all_batch_inputs[batch_number]
+                dummy_inputs = self.all_dummy_inputs[batch_number]
+
+                batch_targets = self.all_batch_targets[batch_number]
+                dummy_targets = self.all_dummy_targets[batch_number]
+
+                standard_mapping = np.arange(batch_inputs.shape[0])
+
+                input_mapping = get_batch_sample_mapping(
+                    batch_inputs,
+                    dummy_inputs,
+                )
+
+                sample_mapping = input_mapping
+
+                # Preserve the existing forecasting matching behavior.
+                if config["dataset"] not in CLASSIFICATION_DATASETS:
+                    target_mapping = get_batch_sample_mapping(
+                        batch_targets,
+                        dummy_targets,
+                    )
+
+                    if (
+                        np.array_equal(input_mapping, standard_mapping)
+                        and not np.array_equal(
+                            target_mapping,
+                            standard_mapping,
+                        )
+                    ):
+                        sample_mapping = target_mapping
+
+                mapping_tensor = torch.as_tensor(
+                    sample_mapping,
+                    dtype=torch.long,
+                    device=dummy_inputs.device,
+                )
+
+                reconstructed_inputs = dummy_inputs.index_select(
+                    0,
+                    mapping_tensor,
+                )
+
+                input_difference = (
+                    reconstructed_inputs - batch_inputs
+                )
+
+                input_absolute_error_sum += (
+                    input_difference.abs().sum().item()
+                )
+                input_squared_error_sum += (
+                    input_difference.square().sum().item()
+                )
+                input_element_count += input_difference.numel()
+                total_samples += batch_inputs.shape[0]
+
+                input_batch_maes.append(
+                    input_difference.abs().mean().item()
+                )
+
+                if config["dataset"] not in CLASSIFICATION_DATASETS:
+                    target_mapping_tensor = torch.as_tensor(
+                        sample_mapping,
+                        dtype=torch.long,
+                        device=dummy_targets.device,
+                    )
+
+                    reconstructed_targets = dummy_targets.index_select(
+                        0,
+                        target_mapping_tensor,
+                    )
+
+                    target_difference = (
+                        reconstructed_targets - batch_targets
+                    )
+
+                    target_absolute_error_sum += (
+                        target_difference.abs().sum().item()
+                    )
+                    target_squared_error_sum += (
+                        target_difference.square().sum().item()
+                    )
+                    target_element_count += target_difference.numel()
+
+                    target_batch_maes.append(
+                        target_difference.abs().mean().item()
+                    )
+
+                    # Weight batch SMAPE by its number of elements.
+                    input_smape_weighted_sum += (
+                        SMAPELoss(
+                            reconstructed_inputs,
+                            batch_inputs,
+                        ).item()
+                        * input_difference.numel()
+                    )
+
+                    target_smape_weighted_sum += (
+                        SMAPELoss(
+                            reconstructed_targets,
+                            batch_targets,
+                        ).item()
+                        * target_difference.numel()
+                    )
+
+        if input_element_count == 0:
+            print("No reconstructed elements available for aggregation.")
+            return
+
+        aggregate_input_mae = (
+            input_absolute_error_sum / input_element_count
+        )
+        aggregate_input_mse = (
+            input_squared_error_sum / input_element_count
+        )
+
+        aggregate_metrics = {
+            "aggregate/inputs/mae/mean": aggregate_input_mae,
+            "aggregate/inputs/mse/mean": aggregate_input_mse,
+            "aggregate/inputs/rmse/mean": np.sqrt(
+                aggregate_input_mse
+            ),
+            "aggregate/inputs/mae/std_across_batches": float(
+                np.std(input_batch_maes)
+            ),
+            "aggregate/number_of_attack_batches": number_of_attacks,
+            "aggregate/number_of_samples": total_samples,
+        }
+
+        if (
+            config["dataset"] not in CLASSIFICATION_DATASETS
+            and target_element_count > 0
+        ):
+            aggregate_target_mae = (
+                target_absolute_error_sum / target_element_count
+            )
+            aggregate_target_mse = (
+                target_squared_error_sum / target_element_count
+            )
+
+            aggregate_metrics.update(
+                {
+                    "aggregate/inputs/smape/mean": (
+                        input_smape_weighted_sum
+                        / input_element_count
+                    ),
+                    "aggregate/targets/mae/mean": (
+                        aggregate_target_mae
+                    ),
+                    "aggregate/targets/mse/mean": (
+                        aggregate_target_mse
+                    ),
+                    "aggregate/targets/rmse/mean": np.sqrt(
+                        aggregate_target_mse
+                    ),
+                    "aggregate/targets/smape/mean": (
+                        target_smape_weighted_sum
+                        / target_element_count
+                    ),
+                    "aggregate/targets/mae/std_across_batches": (
+                        float(np.std(target_batch_maes))
+                    ),
+                }
+            )
+
+        # Use a step after the last ordinary reconstruction log.
+        aggregate_step = (
+            config["num_attack_steps"]
+            + config.get("num_learn_epochs", 0)
+            + 1
+        )
+
+        self._log_metrics(
+            aggregate_metrics,
+            step=aggregate_step,
+        )
+
+        print(
+            "Aggregate reconstruction metrics across "
+            f"{number_of_attacks} attack batches:",
+            aggregate_metrics,
+        )
 
     def evaluate_and_log_reconstruction(
         self,
