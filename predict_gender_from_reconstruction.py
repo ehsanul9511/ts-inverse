@@ -3,7 +3,8 @@
 
 Example:
     python predict_gender_from_reconstruction.py \
-        --reconstruction ../data/_reconstructions/motionsense_reconstruction_run_0_batch_0.pt
+        --reconstruction ../data/_reconstructions/ \
+        --output-csv gender_predictions.csv
 
 The reconstruction file may be either:
   * a tensor containing reconstructed windows; or
@@ -17,8 +18,10 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import re
 
 import numpy as np
+import pandas as pd
 import torch
 from torch import nn
 
@@ -77,8 +80,18 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--reconstruction",
-        default="/scratch/ejk5818/ts-inverse/reconstructions/motionsense_reconstruction_run_0_batch_0.pt",
-        help="Path to the saved reconstructed-data .pt file",
+        default="/scratch/ejk5818/ts-inverse/reconstructions/",
+        help="Path to one reconstruction .pt file or a directory containing them",
+    )
+    parser.add_argument(
+        "--pattern",
+        default="motionsense_reconstruction_run_*_batch_*.pt",
+        help="Glob used when --reconstruction is a directory",
+    )
+    parser.add_argument(
+        "--output-csv",
+        default="gender_predictions.csv",
+        help="Destination CSV file",
     )
     parser.add_argument(
         "--model",
@@ -181,11 +194,20 @@ def prepare_windows(
     return windows.contiguous()
 
 
+def reconstruction_sort_key(path: Path):
+    """Sort run and batch numbers numerically instead of lexicographically."""
+    match = re.search(r"run_(\d+)_batch_(\d+)", path.stem)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return float("inf"), path.name
+
+
 def main():
     args = parse_args()
     device = select_device()
     model_path = Path(args.model)
     reconstruction_path = Path(args.reconstruction)
+    output_csv = Path(args.output_csv)
 
     if not model_path.exists():
         raise FileNotFoundError(f"Gender model not found: {model_path}")
@@ -211,56 +233,85 @@ def main():
     model.load_state_dict(state_dict, strict=True)
     model.eval()
 
-    reconstruction_object = trusted_torch_load(reconstruction_path, "cpu")
-    reconstructed_data, true_genders = extract_reconstruction(reconstruction_object)
-    windows = prepare_windows(
-        reconstructed_data,
-        num_features,
-        window_size,
-        checkpoint,
-        args.input_is_raw,
-    ).to(device)
+    if reconstruction_path.is_dir():
+        reconstruction_files = sorted(
+            reconstruction_path.glob(args.pattern),
+            key=reconstruction_sort_key,
+        )
+    else:
+        reconstruction_files = [reconstruction_path]
+
+    if not reconstruction_files:
+        raise FileNotFoundError(
+            f"No files matching {args.pattern!r} found in {reconstruction_path}"
+        )
+
+    all_windows = []
+    all_genders = []
+    source_files = []
+
+    for file_path in reconstruction_files:
+        reconstruction_object = trusted_torch_load(file_path, "cpu")
+        reconstructed_data, genders = extract_reconstruction(reconstruction_object)
+        prepared = prepare_windows(
+            reconstructed_data,
+            num_features,
+            window_size,
+            checkpoint,
+            args.input_is_raw,
+        )
+
+        if genders is None:
+            raise KeyError(f"No gender labels found in {file_path}")
+
+        genders = torch.as_tensor(genders, dtype=torch.long).reshape(-1)
+        if len(genders) != len(prepared):
+            raise ValueError(
+                f"{file_path} has {len(prepared)} reconstructions but "
+                f"{len(genders)} gender labels"
+            )
+
+        all_windows.append(prepared)
+        all_genders.append(genders)
+        source_files.extend([file_path.name] * len(prepared))
+
+    windows = torch.cat(all_windows, dim=0).to(device)
+    true_gender_tensor = torch.cat(all_genders, dim=0)
 
     with torch.inference_mode():
         logits = model(windows)
         male_probabilities = torch.sigmoid(logits).cpu()
         predictions = (male_probabilities >= args.threshold).long()
 
-    true_gender_tensor = None
-    if true_genders is not None:
-        true_gender_tensor = torch.as_tensor(true_genders).long().reshape(-1)
-        if len(true_gender_tensor) != len(predictions):
-            raise ValueError(
-                f"Found {len(predictions)} reconstructions but "
-                f"{len(true_gender_tensor)} true gender labels"
-            )
-
-    print(f"Device: {device}")
-    print(f"Reconstructed windows: {tuple(windows.shape)}")
-    print("Label convention: 0 = female, 1 = male\n")
-
-    for index, (probability, prediction) in enumerate(
-        zip(male_probabilities, predictions)
-    ):
-        predicted_name = "male" if prediction.item() == 1 else "female"
-        line = (
-            f"Sample {index}: probability_male={probability.item():.6f}, "
-            f"prediction={prediction.item()} ({predicted_name})"
+    if len(true_gender_tensor) != len(predictions):
+        raise ValueError(
+            f"Found {len(predictions)} predictions but "
+            f"{len(true_gender_tensor)} true gender labels"
         )
 
-        if true_gender_tensor is not None:
-            truth = true_gender_tensor[index].item()
-            truth_name = "male" if truth == 1 else "female"
-            line += (
-                f", true_gender={truth} ({truth_name}), "
-                f"correct={prediction.item() == truth}"
-            )
+    results = pd.DataFrame(
+        {
+            "sample_index": np.arange(len(predictions)),
+            "source_file": source_files,
+            "probability_male": male_probabilities.numpy(),
+            "prediction": predictions.numpy(),
+            "predicted_gender": np.where(predictions.numpy() == 1, "male", "female"),
+            "true_gender": true_gender_tensor.numpy(),
+            "true_gender_name": np.where(
+                true_gender_tensor.numpy() == 1, "male", "female"
+            ),
+            "correct": (predictions == true_gender_tensor).numpy(),
+        }
+    )
 
-        print(line)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    results.to_csv(output_csv, index=False)
 
-    if true_gender_tensor is not None:
-        accuracy = (predictions == true_gender_tensor).float().mean().item()
-        print(f"\nAccuracy on reconstructed samples: {accuracy:.4f}")
+    accuracy = results["correct"].mean()
+    print(f"Loaded {len(reconstruction_files)} reconstruction files")
+    print(f"Evaluated {len(results)} reconstructed windows on {device}")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Saved predictions: {output_csv.resolve()}")
 
 
 if __name__ == "__main__":

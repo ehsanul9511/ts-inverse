@@ -25,4 +25,6 @@ media/*
 
 reconstructions/*
 *.npz
+*.csv
+*.png
 ideal_household_scripts/*

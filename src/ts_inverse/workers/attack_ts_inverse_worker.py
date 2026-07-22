@@ -507,8 +507,86 @@ class AttackTSInverseWorker(Worker):
                         dummy_targets.unsqueeze(-1)
                     )
 
-                if config["dataset"] not in CLASSIFICATION_DATASETS:
-                    combined_dummy_data_first_feature = torch.cat([dummy_inputs[:, :, 0], dummy_targets[:, :]], dim=1)  # Same series
+                if config["dataset"] == "motionsense":
+                    # Input-only low-resolution regularization.
+                    lower_res_weight = config.get(
+                        "lower_res_term_inputs",
+                        config.get("lower_res_term", 0),
+                    )
+
+                    if lower_res_weight > 0:
+                        with torch.no_grad():
+                            warped_inputs = temporal_resolution_warping(
+                                dummy_inputs,
+                                2,
+                            )
+                            filtered_inputs = interpolate(
+                                warped_inputs,
+                                dummy_inputs.shape[1],
+                            )
+
+                        dy_dx_loss += (
+                            lower_res_weight
+                            * F.l1_loss(filtered_inputs, dummy_inputs)
+                        )
+
+                    if config.get("trend_term", 0) > 0:
+                        trend_lr_term = 1.0
+
+                        if (
+                            attack_step > 0
+                            and config.get("trend_reduce_lr", False)
+                            and dummy_schedular is not None
+                        ):
+                            trend_lr_term = (
+                                dummy_schedular.get_last_lr()[0]
+                                / config["optimization_learning_rate"]
+                            )
+
+                        dy_dx_loss += (
+                            trend_lr_term
+                            * config["trend_term"]
+                            * featurewise_trend_regularization(
+                                dummy_inputs,
+                                config["trend_loss"],
+                            )
+                        )
+
+                    if config.get("periodicity_term", 0) > 0:
+                        period = int(config["periodicity_period"])
+
+                        periodicity_lr_term = 1.0
+
+                        if (
+                            attack_step > 0
+                            and config.get("periodicity_reduce_lr", False)
+                            and dummy_schedular is not None
+                        ):
+                            periodicity_lr_term = (
+                                dummy_schedular.get_last_lr()[0]
+                                / config["optimization_learning_rate"]
+                            )
+
+                        dy_dx_loss += (
+                            periodicity_lr_term
+                            * config["periodicity_term"]
+                            * featurewise_periodicity_regularization(
+                                dummy_inputs,
+                                period=period,
+                                loss=config["periodicity_loss"],
+                            )
+                        )
+
+                elif config["dataset"] not in CLASSIFICATION_DATASETS:
+                    # Keep the existing forecasting implementation here.
+                    combined_dummy_data_first_feature = torch.cat(
+                        [
+                            dummy_inputs[:, :, 0],
+                            dummy_targets[:, :],
+                        ],
+                        dim=1,
+                    )
+
                     if "lower_res_term_inputs" in config and config["lower_res_term_inputs"] > 0:
                         with torch.no_grad():
                             warped_inputs = temporal_resolution_warping(dummy_inputs, 2)
@@ -1011,10 +1089,26 @@ class AttackTSInverseWorker(Worker):
         )
 
         if "dummy_init_method" not in config or config["dummy_init_method"] == "rand":
-            all_dummy_inputs = [
-                torch.rand_like(batch_input_example, device=config["device"], requires_grad=True)
-                for _ in range(attack_number_of_batches)
-            ]
+            if config["dataset"] == "motionsense":
+                # MotionSense inputs are standardized, approximately mean=0, std=1.
+                all_dummy_inputs = [
+                    torch.randn_like(
+                        batch_input_example,
+                        device=config["device"],
+                        requires_grad=True,
+                    )
+                    for _ in range(attack_number_of_batches)
+                ]
+            else:
+                # Existing initialization for datasets normalized to [0, 1].
+                all_dummy_inputs = [
+                    torch.rand_like(
+                        batch_input_example,
+                        device=config["device"],
+                        requires_grad=True,
+                    )
+                    for _ in range(attack_number_of_batches)
+                ]
             
             if config["dataset"] in CLASSIFICATION_DATASETS:
                 # Minimal classification attack: the activity label is known.
@@ -1828,3 +1922,43 @@ def plot_quantile_dummy_data(config, sample_mapping, dummy_quantile_inputs, dumm
         plt.close(fig)
 
     return df, fig
+
+def featurewise_trend_regularization(x, loss):
+    """Average the trend loss over every sample and feature.
+
+    x has shape [batch, time, features].
+    """
+    losses = [
+        trend_consistency_regularization(
+            x[b : b + 1, :, feature],
+            loss,
+        )
+        for b in range(x.shape[0])
+        for feature in range(x.shape[2])
+    ]
+
+    return torch.stack(losses).mean()
+
+
+def featurewise_periodicity_regularization(x, period, loss):
+    """Average the periodicity loss over every sample and feature.
+
+    x has shape [batch, time, features].
+    """
+    if period <= 0 or period >= x.shape[1]:
+        raise ValueError(
+            f"period must be between 1 and {x.shape[1] - 1}; "
+            f"received {period}"
+        )
+
+    losses = [
+        periodicity_regularization(
+            x[b : b + 1, :, feature],
+            period=period,
+            loss=loss,
+        )
+        for b in range(x.shape[0])
+        for feature in range(x.shape[2])
+    ]
+
+    return torch.stack(losses).mean()
