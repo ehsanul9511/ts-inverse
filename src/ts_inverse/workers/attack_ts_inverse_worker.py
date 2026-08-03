@@ -42,6 +42,12 @@ CLASSIFICATION_DATASETS = {
     "motionsense",
 }
 
+FEATURE_NAMES = [
+    "acc_x", "acc_y", "acc_z",
+    "gyro_x", "gyro_y", "gyro_z",
+    "gravity_x", "gravity_y", "gravity_z",
+    "rot_rate_x", "rot_rate_y", "rot_rate_z",
+]
 
 class AttackTSInverseWorker(Worker):
     def __init__(self, worker_id):
@@ -724,6 +730,32 @@ class AttackTSInverseWorker(Worker):
                 output_path,
             )
 
+            # Saving original batch inputs and targets for reference
+            original_data = (
+                batch_inputs.detach().cpu()
+            )
+
+            original_data_path = os.path.join(
+                output_directory,
+                (
+                    f"motionsense_original_"
+                    f"run_{config['run_number']}_"
+                    f"batch_{batch_number}.pt"
+                ),
+            )
+
+            torch.save(
+                {
+                    "original_data": original_data,
+                    "gender":corresponding_genders,
+                },
+                original_data_path,
+            )
+
+            print(
+                "Saved original data and gender:",
+                original_data_path,
+            )
 
     def learned_prior_regularization(self, dummy_inputs, dummy_targets, regularization_inputs, regularization_targets, config):
         learned_prior_regularization = torch.zeros(1, device=dummy_inputs.device)
@@ -1771,6 +1803,16 @@ class AttackTSInverseWorker(Worker):
                 )
                 self._log_dataframe(df, attack_step + attack_step_offset, log_name=f"_batch_{batch_number}")
                 self._log_matplotlib_figure(fig, step=attack_step + attack_step_offset, log_name=f"_batch_{batch_number}")
+
+            # Changes number of steps before new plots are logged for the MotionSense data
+            elif dataset_name == "motionsense" and attack_step % (num_attack_steps // log_plots_n_times) == 0:
+                df, fig = plot_channel_grid_original_vs_reconstructed(
+                    config, sample_mapping, dummy_inputs, batch_inputs, sample_idx=0
+                )
+                self._log_dataframe(df, attack_step + attack_step_offset, log_name=f"_batch_{batch_number}_sample_0")
+                self._log_matplotlib_figure(
+                    fig, step=attack_step + attack_step_offset, log_name=f"_batch_{batch_number}_sample_0"
+                )
             self._log_metrics(attack_metrics, step=attack_step + attack_step_offset)
 
     def plot_gradients(self, dummy_dy_dx, original_dy_dx, config):
@@ -1929,6 +1971,53 @@ def plot_original_and_dummy_data(config, sample_mapping, dummy_inputs, dummy_tar
 
     return df, fig
 
+def plot_channel_grid_original_vs_reconstructed(config, sample_mapping, dummy_inputs, batch_inputs, sample_idx=0):
+    original = batch_inputs[sample_idx].detach().cpu().numpy()  # [seq_len, n_features]
+    reconstructed = dummy_inputs[sample_mapping[sample_idx]].detach().cpu().numpy()
+ 
+    num_features = original.shape[-1]
+ 
+    fig, axes = plt.subplots(num_features, 2, figsize=(8, 2 * num_features), sharex=True)
+ 
+    for feature_idx in range(num_features):
+        feature_name = FEATURE_NAMES[feature_idx] if feature_idx < len(FEATURE_NAMES) else f"feature_{feature_idx}"
+ 
+        ax_original = axes[feature_idx, 0]
+        ax_reconstructed = axes[feature_idx, 1]
+ 
+        ax_original.plot(original[:, feature_idx], color="tab:blue", linewidth=1.2)
+        ax_reconstructed.plot(reconstructed[:, feature_idx], color="tab:orange", linewidth=1.2)
+ 
+        ax_original.set_ylabel(feature_name, fontsize=9)
+ 
+        if feature_idx == 0:
+            ax_original.set_title("Original", fontsize=11)
+            ax_reconstructed.set_title("Reconstructed", fontsize=11)
+ 
+        if feature_idx == num_features - 1:
+            ax_original.set_xlabel("Time step")
+            ax_reconstructed.set_xlabel("Time step")
+ 
+    fig.suptitle(
+        f'{config["dataset"]}: Batch {sample_idx} (matched dummy {sample_mapping[sample_idx]}) '
+        f'\u2014 Original vs. Reconstructed by Channel',
+        fontsize=13,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+ 
+    data = {}
+    for feature_idx in range(num_features):
+        feature_name = FEATURE_NAMES[feature_idx] if feature_idx < len(FEATURE_NAMES) else f"feature_{feature_idx}"
+        data[f"original_{feature_name}"] = original[:, feature_idx]
+        data[f"reconstructed_{feature_name}"] = reconstructed[:, feature_idx]
+    df = pd.DataFrame(data)
+ 
+    if config["verbose"]:
+        plt.show()
+    else:
+        plt.close(fig)
+ 
+    return df, fig
 
 def get_batch_sample_mapping(original_data, dummy_data, function=F.l1_loss):
     batch_size = original_data.shape[0]

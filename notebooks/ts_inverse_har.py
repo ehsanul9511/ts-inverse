@@ -203,7 +203,7 @@ global_config = {
     'total_variation_beta_targets': 0,
     'after_effect': 'none',
     'warmup_number_of_batches': 0,
-    'number_of_batches': 20,
+    'number_of_batches': 2,
     'update_model': False, # Update the model in generating gradients from training data
     'model_evaluation_during_attack': False, # Baselines do not consider this
     'load_lti_model': False,
@@ -217,7 +217,7 @@ global_config = {
     "model_train_batch_size": 64,
     "model_train_learning_rate": 1e-3,
 
-    "reconstruction_output_dir": "/scratch/ejk5818/ts-inverse/reconstructions/",
+    "reconstruction_output_dir": "/scratch/ddl5280/ts-inverse/reconstructions/",
 }
 
 attack_config = [
@@ -245,10 +245,10 @@ attack_config = [
 
         'lower_res_term': [0],
         "lower_res_term_inputs": [0.0],
-        'trend_term': [0.1],
+        'trend_term': [0.0],
         'trend_loss': ['l1_mean'],
         'trend_reduce_lr': [False],
-        'periodicity_term': [0.1],
+        'periodicity_term': [0.0],
         'periodicity_loss': ['l1_mean'],
         "periodicity_period": [25],
         'periodicity_reduce_lr': [False],
@@ -270,7 +270,7 @@ attack_config = [
         'grad_signs_for_targets': False,
         'grad_signs_for_dropouts': True, #[False, True],
 
-        'attack_number_of_batches': 20,
+        'attack_number_of_batches': 2,
     },
 ]
 
@@ -293,5 +293,9 @@ model_config = [
         "_attack_step_multiplier": 10,
     }
 ]
+# For testing
+#print("Trend:",attack_config[0]['trend_term'])
+#print("Periodicity:",attack_config[0]['periodicity_term'])
+
 
 start_multi_process(global_config, attack_config, dataset_config, model_config, global_config['pool_size'])
