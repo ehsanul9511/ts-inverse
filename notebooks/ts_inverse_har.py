@@ -203,7 +203,7 @@ global_config = {
     'total_variation_beta_targets': 0,
     'after_effect': 'none',
     'warmup_number_of_batches': 0,
-    'number_of_batches': 2,
+    'number_of_batches': 1,
     'update_model': False, # Update the model in generating gradients from training data
     'model_evaluation_during_attack': False, # Baselines do not consider this
     'load_lti_model': False,
@@ -245,10 +245,15 @@ attack_config = [
 
         'lower_res_term': [0],
         "lower_res_term_inputs": [0.0],
-        'trend_term': [0.0],
+        'trend_term': [{
+            'acc': 0.19,
+            'gyro': 0.19,
+            'gravity': 0.01,
+            'rot_rate': 0.01,
+        }],
         'trend_loss': ['l1_mean'],
         'trend_reduce_lr': [False],
-        'periodicity_term': [0.0],
+        'periodicity_term': [0.1],
         'periodicity_loss': ['l1_mean'],
         "periodicity_period": [25],
         'periodicity_reduce_lr': [False],
@@ -270,7 +275,7 @@ attack_config = [
         'grad_signs_for_targets': False,
         'grad_signs_for_dropouts': True, #[False, True],
 
-        'attack_number_of_batches': 2,
+        'attack_number_of_batches': 1,
     },
 ]
 
@@ -294,8 +299,8 @@ model_config = [
     }
 ]
 # For testing
-#print("Trend:",attack_config[0]['trend_term'])
-#print("Periodicity:",attack_config[0]['periodicity_term'])
+print("Trend:",attack_config[0]['trend_term'])
+print("Periodicity:",attack_config[0]['periodicity_term'])
 
 
 start_multi_process(global_config, attack_config, dataset_config, model_config, global_config['pool_size'])
