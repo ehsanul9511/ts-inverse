@@ -6,12 +6,14 @@ import torch
 import torch.nn as nn
 import psutil
 
+from ts_inverse.models.iTransformer import Model as iTransformer
+
 import os
 username = os.getenv("USER")
 
 data_path_dict = {
     "ejk5818": "/scratch/ejk5818/ts-inverse/data/motion-sense/",
-    "ddl5280": "/scratch/ddl5280/ts-inverse/data/",
+    "ddl5280": "/scratch/ddl5280/research/ts-inverse/data/ETT-small/",
 }
 
 class MotionSenseActivityCNN(nn.Module):
@@ -195,7 +197,7 @@ global_config = {
     # 'seed': [10, 43, 28, 80, 71], # 28, 80, 71],
     'seed': [43], # 28, 80, 71],
     'batch_size': 1,
-    'device': 0,
+    'device': 'cpu',
     'verbose': False,
     'pool_size': 1,
     'run_number': -1,
@@ -281,20 +283,30 @@ attack_config = [
 
 dataset_config = [
     {
-        "dataset": "motionsense",
-        # "data_path": "/scratch/ejk5818/ts-inverse/data/motion-sense/",
-        "data_path": data_path_dict[username] if username in data_path_dict else None,
-        "seq_len": 50,
-        "stride": 10,
-        "num_features": 12,
-        "num_classes": 4,
+        "dataset": "ETTh1",
+        "root_path": data_path_dict[username] if username in data_path_dict else None,
+        # "data_path": data_path_dict[username] if username in data_path_dict else None,
+        # "seq_len": 50,
+        # "stride": 10,
+        # "num_features": 12,
+        # "num_classes": 4,
+        "seq_len": 96,
+        "label_len": 48,
+        "pred_len": 96,
+        "features": "M",
+        "target": "OT",
+        "scale": True,
+        "timeenc": 0,
+        "freq": "h",
         "normalize": "standard",
+        "observation_days": 96,
+        "future_days": 96,
     },
 ]
 
 model_config = [
     {
-        "_model": MotionSenseActivityCNN,
+        "_model": iTransformer,
         "_attack_step_multiplier": 10,
     }
 ]

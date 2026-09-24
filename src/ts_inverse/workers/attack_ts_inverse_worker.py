@@ -34,6 +34,7 @@ from ts_inverse.datahandler import (
     get_mean_std_dataloader,
     get_har_dataset,
     get_motionsense_dataset,
+    get_ett_dataset,
 )
 from .forecasting_worker import evaluate_model
 
@@ -81,6 +82,25 @@ class AttackTSInverseWorker(Worker):
                 )
             )
             print("Loaded MotionSense activity dataset")
+        
+        elif dataset_name in {"ETTh1", "ETTh2", "ETTm1", "ETTm2"}:
+            self.train_datasets, self.val_datasets, self.test_datasets = (
+                get_ett_dataset(
+                    dataset=dataset_name,
+                    root_path=d_c["root_path"],
+                    data_path=d_c.get("data_path"),
+                    seq_len=d_c.get("seq_len", 96),
+                    label_len=d_c.get("label_len", 48),
+                    pred_len=d_c.get("pred_len", 96),
+                    features=d_c.get("features", "M"),
+                    target=d_c.get("target", "OT"),
+                    scale=d_c.get("scale", True),
+                    timeenc=d_c.get("timeenc", 0),
+                    freq=d_c.get("freq", "h"),
+                )
+            )
+            print(f"Loaded ETT dataset")
+
 
         else:
             self.train_datasets, self.val_datasets, self.test_datasets = (
@@ -123,7 +143,7 @@ class AttackTSInverseWorker(Worker):
             mean_std_dataloader, c["device"]
         )
 
-        if dataset_name == "realworld":
+        if dataset_name in {"realworld", "ETTh1", "ETTh2", "ETTm1", "ETTm2"}:
             model = final_model_settings["_model"]()
 
         elif dataset_name == "motionsense":
