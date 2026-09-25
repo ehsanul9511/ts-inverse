@@ -201,32 +201,51 @@ global_config = {
     'verbose': False,
     'pool_size': 1,
     'run_number': -1,
-    'total_variation_alpha_inputs': 0, 
+    'total_variation_alpha_inputs': 0.025, 
     'total_variation_beta_targets': 0,
     'after_effect': 'none',
     'warmup_number_of_batches': 0,
     'number_of_batches': 1,
     'update_model': False, # Update the model in generating gradients from training data
     'model_evaluation_during_attack': False, # Baselines do not consider this
-    'load_lti_model': False,
+    'load_lti_model': True,
 
     'dropout': 0,
     'optimize_dropout': False,
     'dropout_probability_regularizer': 0,
     'dummy_init_method': 'rand',
 
-    "model_train_epochs": 20,
+    "model_train_epochs": 5,
     "model_train_batch_size": 64,
     "model_train_learning_rate": 1e-3,
 
-    "reconstruction_output_dir": "/scratch/ddl5280/ts-inverse/reconstructions/",
+    "reconstruction_output_dir": (
+        "/scratch/ejk5818/ts-inverse/reconstructions/mobifall/"
+    ),
+
+    "defense_name": "none",
 }
 
 attack_config = [
     {
         'attack_method': 'TS-Inverse',
+        # Opt-in, two-stage generative attack. The original direct-input
+        # optimization remains unchanged when this flag is False.
+        'timegan_gifd_enabled': True,
+        'timegan_checkpoint_root': (
+            '/scratch/ejk5818/ts-inverse/models/'
+            'mobifall_timegan'
+        ),
+        'timegan_gifd_latent_steps': 2000,
+        'timegan_gifd_feature_steps': 4000,
+        'timegan_gifd_latent_learning_rate': 0.05,
+        'timegan_gifd_feature_learning_rate': 0.01,
+        'timegan_gifd_feature_l1_radius': 60.0,
+        'timegan_gifd_optimizer': 'adam',
+        'timegan_gifd_lr_decay': 'on_plateau_10',
+        'timegan_gifd_sign_gradients': False,
         # invert attack
-        'num_learn_epochs': 0,
+        'num_learn_epochs': 50,
         'learn_learning_rate': 1e-3, 
         'attack_batch_size': 32,
         'inversion_batch_size': 1, # global_config['batch_size'],
@@ -241,7 +260,7 @@ attack_config = [
         'one_shot_targets': False,
 
         ## Inversion regularization in optimization attack
-        'inversion_regularization_term_inputs': [0], 
+        'inversion_regularization_term_inputs': [0.05], 
         'inversion_regularization_term_targets': [0],
         'inversion_regularization_loss': ['quantile'],
 

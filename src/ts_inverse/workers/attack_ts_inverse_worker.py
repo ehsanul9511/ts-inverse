@@ -1,5 +1,6 @@
 import os
 from copy import deepcopy
+from tqdm import tqdm
 import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.data import DataLoader, ConcatDataset, TensorDataset
 
@@ -257,11 +258,22 @@ class AttackTSInverseWorker(Worker):
 
         # Prior knowledge datasets
         if dataset_name in CLASSIFICATION_DATASETS:
+            # Build one auxiliary gradient per sample.  inversion_model_epoch
+            # later groups these records to reproduce the attacked batch size
+            # before averaging their gradients.
             self.auxiliary_train_dataloader = DataLoader(
-                aux_trainset, batch_size=128, shuffle=False
+                aux_trainset,
+                batch_size=1,
+                shuffle=False,
+                worker_init_fn=seed_worker,
+                generator=self.g,
             )
             self.auxiliary_val_dataloader = DataLoader(
-                aux_valset, batch_size=128, shuffle=False
+                aux_valset,
+                batch_size=1,
+                shuffle=False,
+                worker_init_fn=seed_worker,
+                generator=self.g,
             )
         else:
             self.auxiliary_train_dataloader = DataLoader(
@@ -343,7 +355,7 @@ class AttackTSInverseWorker(Worker):
                 config["num_learn_epochs"],
             )
 
-            def generate_model_path(config, folder_path, batch_number, model, aux_gi_t_dataloader):
+            def generate_model_path(config, folder_path):
                 keys = [
                     "inversion_model",
                     "defense_name",
@@ -364,30 +376,25 @@ class AttackTSInverseWorker(Worker):
                     "inversion_batch_size",
                     "quantiles",
                 ]
+                dataset_name = config["dataset"]
 
                 path_components = [
                     folder_path,
                     "grad_inputs_targets_model",
-                    str(batch_number),
-                    *(
-                        str("-".join(map(str, config[key])) if isinstance(config[key], list) else config[key])
-                        for key in keys
-                        if key in config and config[key]
-                    ),
-                    model.name,
-                    "-".join(map(str, model.features)),
-                    str(len(aux_gi_t_dataloader.dataset)),
+                    # str(batch_number),
+                    dataset_name,
                 ]
 
                 return "_".join(path_components) + ".pt"
 
             folder_path = "../data/_model_dataset_gradients/"
-            model_path = generate_model_path(config, folder_path, batch_number, model, aux_gi_t_dataloader)
+            model_path = generate_model_path(config, folder_path)
             if os.path.exists(model_path) and config["load_lti_model"]:
                 inversion_model.load_state_dict(torch.load(model_path))
                 print("Loaded inversion model to file.")
             else:
-                for epoch in range(0, config["num_learn_epochs"] + 1):
+
+                for epoch in tqdm(range(config["num_learn_epochs"])):
                     epoch_t_loss = self.inversion_model_epoch(
                         config, epoch, aux_gi_t_dataloader, inversion_model, grad_to_input_optimizer, lr_schedular
                     )
@@ -416,7 +423,11 @@ class AttackTSInverseWorker(Worker):
         if config["num_attack_steps"] == 0:
             return
 
-        if config["batch_size"] == 1 and config["one_shot_targets"]:
+        if (
+            config["dataset"] not in CLASSIFICATION_DATASETS
+            and config["batch_size"] == 1
+            and config["one_shot_targets"]
+        ):
             with torch.no_grad():
                 grad_w = original_dy_dx[-2]
                 grad_b = original_dy_dx[-1].unsqueeze(-1)
@@ -433,14 +444,20 @@ class AttackTSInverseWorker(Worker):
                     flattened_original_dy_dx.unsqueeze(0)
                 )
                 regularization_inputs = dummy_quantile_inputs.squeeze(0)  # remove batch dimension
-                regularization_targets = predicted_dummy_quantile_targets.squeeze(0)  # remove batch dimension
+                regularization_targets = None
                 # Repeat regularization inputs and targets to match the batch size
                 regularization_inputs = regularization_inputs.repeat(
                     batch_inputs.shape[0] // config["inversion_batch_size"], 1, 1, 1
                 )
-                regularization_targets = regularization_targets.repeat(
-                    batch_targets.shape[0] // config["inversion_batch_size"], 1, 1
-                )
+                if predicted_dummy_quantile_targets is not None:
+                    regularization_targets = (
+                        predicted_dummy_quantile_targets.squeeze(0).repeat(
+                            batch_targets.shape[0]
+                            // config["inversion_batch_size"],
+                            1,
+                            1,
+                        )
+                    )
 
                 # The regularized inputs, targets last dimension are the quantiles and these should be swaped with the batch dimension
                 # dummy_inputs = regularization_inputs.permute(3, 1, 2, 0).squeeze(-1).detach().requires_grad_(True)
@@ -452,7 +469,6 @@ class AttackTSInverseWorker(Worker):
             else:
                 regularization_inputs, regularization_targets = inversion_model(flattened_original_dy_dx.unsqueeze(0))
                 regularization_inputs = regularization_inputs.view(batch_inputs.size()).detach()
-                regularization_targets = regularization_targets.view(batch_targets.size()).detach()
                 dummy_inputs = regularization_inputs.detach().clone().requires_grad_(True)
                 dummy_targets = regularization_targets.detach().clone().requires_grad_(True)
 
@@ -485,7 +501,18 @@ class AttackTSInverseWorker(Worker):
             def closure():
                 dummy_optimizer.zero_grad()
                 model.zero_grad()
-                dy_dx_loss = torch.zeros(1, device=dummy_inputs.device)
+                zero_loss = dummy_inputs.new_zeros(())
+                loss_components = {
+                    "gradient_matching": zero_loss,
+                    "dropout_regularization": zero_loss,
+                    "inversion_regularization": zero_loss,
+                    "total_variation_inputs": zero_loss,
+                    "total_variation_targets": zero_loss,
+                    "lower_resolution_inputs": zero_loss,
+                    "lower_resolution_targets": zero_loss,
+                    "trend_regularization": zero_loss,
+                    "periodicity_regularization": zero_loss,
+                }
 
                 dummy_out = model(dummy_inputs)
                 # print(f"len(dummy_out): {len(dummy_out)}")
@@ -510,7 +537,11 @@ class AttackTSInverseWorker(Worker):
                         fig, attack_step + config["num_learn_epochs"], log_name="gradients", matplotlib_only=True
                     )
 
-                dy_dx_loss += self.gradient_loss_function(dummy_dy_dx, original_dy_dx, config["gradient_loss"])
+                loss_components["gradient_matching"] = self.gradient_loss_function(
+                    dummy_dy_dx,
+                    original_dy_dx,
+                    config["gradient_loss"],
+                )
 
                 if (
                     "TCN" in model.name
@@ -518,28 +549,34 @@ class AttackTSInverseWorker(Worker):
                     and config["dropout"] > 0
                     and config["dropout_probability_regularizer"] > 0
                 ):
+                    dropout_regularization = zero_loss
                     for dropout_layer in model.get_dropout_layers():
-                        dy_dx_loss += (
+                        dropout_regularization = dropout_regularization + (
                             config["dropout_probability_regularizer"]
                             * ((1 - dropout_layer.do_mask.mean()) - dropout_layer.p).abs()
                         )
+                    loss_components["dropout_regularization"] = dropout_regularization
 
                 if inversion_model is not None and (
                     config["inversion_regularization_term_inputs"] > 0 or config["inversion_regularization_term_targets"] > 0
                 ):
-                    dy_dx_loss += self.learned_prior_regularization(
+                    loss_components["inversion_regularization"] = self.learned_prior_regularization(
                         dummy_inputs, dummy_targets, regularization_inputs, regularization_targets, config
                     )
 
                 if "total_variation_alpha_inputs" in config and config["total_variation_alpha_inputs"] > 0:
-                    dy_dx_loss += config["total_variation_alpha_inputs"] * total_variation_time_series(dummy_inputs)
+                    loss_components["total_variation_inputs"] = (
+                        config["total_variation_alpha_inputs"]
+                        * total_variation_time_series(dummy_inputs)
+                    )
                 if (
                     config["dataset"] not in CLASSIFICATION_DATASETS
                     and "total_variation_beta_targets" in config
                     and config["total_variation_beta_targets"] > 0
                 ):
-                    dy_dx_loss += config["total_variation_beta_targets"] * total_variation_time_series(
-                        dummy_targets.unsqueeze(-1)
+                    loss_components["total_variation_targets"] = (
+                        config["total_variation_beta_targets"]
+                        * total_variation_time_series(dummy_targets.unsqueeze(-1))
                     )
 
                 if config["dataset"] == "motionsense":
@@ -560,7 +597,7 @@ class AttackTSInverseWorker(Worker):
                                 dummy_inputs.shape[1],
                             )
 
-                        dy_dx_loss += (
+                        loss_components["lower_resolution_inputs"] = (
                             lower_res_weight
                             * F.l1_loss(filtered_inputs, dummy_inputs)
                         )
@@ -603,7 +640,7 @@ class AttackTSInverseWorker(Worker):
                                 / config["optimization_learning_rate"]
                             )
 
-                        dy_dx_loss += (
+                        loss_components["trend_regularization"] = (
                             trend_lr_term
                             * featurewise_trend_regularization(
                                 dummy_inputs,
@@ -627,7 +664,7 @@ class AttackTSInverseWorker(Worker):
                                 / config["optimization_learning_rate"]
                             )
 
-                        dy_dx_loss += (
+                        loss_components["periodicity_regularization"] = (
                             periodicity_lr_term
                             * config["periodicity_term"]
                             * featurewise_periodicity_regularization(
@@ -651,13 +688,19 @@ class AttackTSInverseWorker(Worker):
                         with torch.no_grad():
                             warped_inputs = temporal_resolution_warping(dummy_inputs, 2)
                             filtered_inputs = interpolate(warped_inputs, dummy_inputs.shape[1])
-                        dy_dx_loss += config["lower_res_term_inputs"] * F.l1_loss(filtered_inputs, dummy_inputs)
+                        loss_components["lower_resolution_inputs"] = (
+                            config["lower_res_term_inputs"]
+                            * F.l1_loss(filtered_inputs, dummy_inputs)
+                        )
 
                     if "lower_res_term_targets" in config and config["lower_res_term_targets"] > 0:
                         with torch.no_grad():
                             warped_targets = temporal_resolution_warping(dummy_targets.unsqueeze(-1), 2)
                             filtered_targets = interpolate(warped_targets, dummy_targets.shape[1]).squeeze(-1)
-                        dy_dx_loss += config["lower_res_term_targets"] * F.l1_loss(filtered_targets, dummy_targets)
+                        loss_components["lower_resolution_targets"] = (
+                            config["lower_res_term_targets"]
+                            * F.l1_loss(filtered_targets, dummy_targets)
+                        )
 
                     if "trend_term" in config and config["trend_term"] > 0:
                         lr_term = (
@@ -665,7 +708,7 @@ class AttackTSInverseWorker(Worker):
                             if attack_step > 0 and config["trend_reduce_lr"]
                             else 1
                         )
-                        dy_dx_loss += (
+                        loss_components["trend_regularization"] = (
                             lr_term
                             * config["trend_term"]
                             * trend_consistency_regularization(combined_dummy_data_first_feature, config["trend_loss"])
@@ -677,7 +720,7 @@ class AttackTSInverseWorker(Worker):
                             if attack_step > 0 and config["trend_reduce_lr"]
                             else 1
                         )
-                        dy_dx_loss += (
+                        loss_components["periodicity_regularization"] = (
                             lr_term
                             * config["periodicity_term"]
                             * periodicity_regularization(
@@ -685,7 +728,9 @@ class AttackTSInverseWorker(Worker):
                             )
                         )
 
-                dy_dx_loss.backward()
+                total_loss = sum(loss_components.values(), zero_loss)
+                loss_components["total"] = total_loss
+                total_loss.backward()
 
                 if config["grad_signs_for_inputs"]:
                     dummy_inputs.grad.sign_()
@@ -700,17 +745,53 @@ class AttackTSInverseWorker(Worker):
                     for dropout_layer in model.get_dropout_layers():
                         dropout_layer.do_mask.grad.sign_()
 
-                return dy_dx_loss
+                return {
+                    name: value.detach()
+                    for name, value in loss_components.items()
+                }
 
-            dy_dx_loss = dummy_optimizer.step(closure)
+            if isinstance(dummy_optimizer, torch.optim.LBFGS):
+                latest_loss_components = None
+
+                def lbfgs_closure():
+                    nonlocal latest_loss_components
+                    latest_loss_components = closure()
+                    return latest_loss_components["total"]
+
+                dummy_optimizer.step(lbfgs_closure)
+                loss_components = latest_loss_components
+            else:
+                loss_components = dummy_optimizer.step(closure)
+
+            if not isinstance(loss_components, dict):
+                raise RuntimeError(
+                    "The attack closure did not return its loss components."
+                )
+
+            dy_dx_loss = loss_components["total"]
+            attack_metrics.update(
+                {
+                    f"loss/{name}": value.item()
+                    for name, value in loss_components.items()
+                }
+            )
+            # Preserve the existing dashboard key while making it represent
+            # only the gradient-matching term rather than the total loss.
+            attack_metrics["grad_diff_loss_mse"] = (
+                loss_components["gradient_matching"].item()
+            )
 
             self.after_effect(config, model, dummy_inputs, dummy_targets, attack_step)
+
+            if config.get("partial_original_init", False):
+                # Undo any changes from weight decay or after_effect clamping.
+                with torch.no_grad():
+                    dummy_inputs[..., :-1].copy_(known_inputs)
 
             self.schedular_step(config["attack_opti_lr_decay"], dummy_schedular, attack_metrics, dy_dx_loss)
 
             # Should calcualte evalaution metrics and log them
             if attack_step % (config["num_attack_steps"] // min(config["num_attack_steps"], 200)) == 0:
-                attack_metrics["grad_diff_loss_mse"] = dy_dx_loss
                 self.evaluate_and_log_reconstruction(
                     config,
                     batch_inputs,
@@ -782,32 +863,696 @@ class AttackTSInverseWorker(Worker):
                 output_path,
             )
 
-            # Saving original batch inputs and targets for reference
-            original_data = (
-                batch_inputs.detach().cpu()
+    def _load_timegan_attack_prior(
+        self,
+        config,
+        batch_inputs,
+        batch_targets,
+    ):
+        dataset_name = config["dataset"]
+        if dataset_name not in {"motionsense", "mobifall"}:
+            raise ValueError(
+                "The TimeGAN GIFD experiment supports MotionSense and "
+                "MobiFall classification experiments."
             )
 
-            original_data_path = os.path.join(
-                output_directory,
-                (
-                    f"motionsense_original_"
-                    f"run_{config['run_number']}_"
-                    f"batch_{batch_number}.pt"
+        unique_labels = torch.unique(batch_targets.detach()).cpu()
+        if unique_labels.numel() != 1:
+            raise ValueError(
+                "A TimeGAN GIFD attack batch must contain one activity. "
+                "Use batch_size=1, or construct activity-homogeneous batches."
+            )
+
+        activity_label = int(unique_labels.item())
+        if activity_label not in ACTIVITY_LABEL_TO_TIMEGAN_ACTIVITY:
+            raise ValueError(
+                f"Unsupported {dataset_name} activity label: "
+                f"{activity_label}"
+            )
+
+        activity = ACTIVITY_LABEL_TO_TIMEGAN_ACTIVITY[
+            activity_label
+        ]
+        checkpoint_path = (
+            Path(config["timegan_checkpoint_root"])
+            / activity
+            / "timegan_checkpoint.pt"
+        )
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"TimeGAN checkpoint not found: {checkpoint_path}"
+            )
+
+        try:
+            checkpoint = torch.load(
+                checkpoint_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+        except TypeError:
+            checkpoint = torch.load(
+                checkpoint_path,
+                map_location="cpu",
+            )
+
+        prior = _TimeGANAttackPrior(
+            checkpoint["timegan_config"]
+        )
+        states = checkpoint["state_dict"]
+        prior.generator.load_state_dict(
+            states["generator"],
+            strict=True,
+        )
+        prior.supervisor.load_state_dict(
+            states["supervisor"],
+            strict=True,
+        )
+        prior.recovery.load_state_dict(
+            states["recovery"],
+            strict=True,
+        )
+        prior = prior.to(batch_inputs.device).train()
+
+        for parameter in prior.parameters():
+            parameter.requires_grad_(False)
+
+        if prior.sequence_length != batch_inputs.shape[1]:
+            raise ValueError(
+                "TimeGAN sequence length does not match the victim input: "
+                f"{prior.sequence_length} != {batch_inputs.shape[1]}"
+            )
+        if dataset_name == "motionsense" and (
+            prior.data_dim != batch_inputs.shape[2]
+        ):
+            raise ValueError(
+                "TimeGAN feature count does not match the victim input: "
+                f"{prior.data_dim} != {batch_inputs.shape[2]}"
+            )
+        if dataset_name == "mobifall":
+            if batch_inputs.shape[2] != 9:
+                raise ValueError(
+                    "The MobiFall victim must use the nine native sensor "
+                    f"features; received {batch_inputs.shape[2]}"
+                )
+            if prior.data_dim not in {9, 12}:
+                raise ValueError(
+                    "The MobiFall TimeGAN prior must produce either nine "
+                    "native features or the 12 engineered features from "
+                    f"train_mobifall_timegan.py; received {prior.data_dim}"
+                )
+
+        preprocessing = checkpoint["preprocessing"]
+        if dataset_name == "mobifall" and prior.data_dim == 12:
+            if (
+                preprocessing.get("external_standardization_mean")
+                is not None
+                or preprocessing.get("external_standardization_std")
+                is not None
+            ):
+                raise ValueError(
+                    "The 12-to-9 MobiFall adapter requires a TimeGAN "
+                    "checkpoint trained without external standardization."
+                )
+        timegan_minimum = torch.as_tensor(
+            preprocessing["timegan_minimum"],
+            dtype=batch_inputs.dtype,
+            device=batch_inputs.device,
+        ).view(1, 1, -1)
+        timegan_range = torch.as_tensor(
+            preprocessing["timegan_range"],
+            dtype=batch_inputs.dtype,
+            device=batch_inputs.device,
+        ).view(1, 1, -1)
+
+        dataset = self.train_datasets[0]
+        if not hasattr(dataset, "normalization_mean") or not hasattr(
+            dataset,
+            "normalization_std",
+        ):
+            raise AttributeError(
+                f"{dataset_name} dataset normalization metadata is "
+                "missing."
+            )
+
+        classifier_mean = torch.as_tensor(
+            dataset.normalization_mean,
+            dtype=batch_inputs.dtype,
+            device=batch_inputs.device,
+        ).view(1, 1, -1)
+        classifier_std = torch.as_tensor(
+            dataset.normalization_std,
+            dtype=batch_inputs.dtype,
+            device=batch_inputs.device,
+        ).view(1, 1, -1)
+        classifier_std = classifier_std.clamp_min(1e-8)
+
+        print(
+            f"Loaded {activity} TimeGAN prior for {dataset_name} label "
+            f"{activity_label}: {checkpoint_path}"
+        )
+
+        return (
+            prior,
+            timegan_minimum,
+            timegan_range,
+            classifier_mean,
+            classifier_std,
+        )
+
+    @staticmethod
+    def _decode_timegan_for_classifier(
+        normalized_output,
+        timegan_minimum,
+        timegan_range,
+        classifier_mean,
+        classifier_std,
+        dataset_name,
+    ):
+        raw_output = (
+            normalized_output * timegan_range + timegan_minimum
+        )
+        if dataset_name == "mobifall" and raw_output.shape[-1] == 12:
+            # train_mobifall_timegan.py generated MotionSense-compatible
+            # channels. Convert them back to MobiFall's nine native sensor
+            # channels for the victim classifier:
+            #   acceleration = (gravity + user acceleration) * g
+            #   orientation APR = attitude RPY reordered and rad -> degree.
+            acceleration = (
+                raw_output[..., 3:6] + raw_output[..., 9:12]
+            ) * MOBIFALL_GRAVITY_M_S2
+            gyroscope = raw_output[..., 6:9]
+            orientation_apr = torch.rad2deg(
+                raw_output[..., [2, 1, 0]]
+            )
+            raw_output = torch.cat(
+                [acceleration, gyroscope, orientation_apr],
+                dim=-1,
+            )
+        return (
+            raw_output - classifier_mean
+        ) / classifier_std
+
+    @staticmethod
+    def _project_feature_l1_ball_(
+        feature,
+        reference,
+        radius,
+    ):
+        """Project each sample onto an L1 ball around its initial feature."""
+        with torch.no_grad():
+            if radius < 0:
+                raise ValueError(
+                    "timegan_gifd_feature_l1_radius must be non-negative"
+                )
+            if radius == 0:
+                feature.copy_(reference)
+                return
+
+            delta = (feature - reference).reshape(
+                feature.shape[0],
+                -1,
+            )
+            l1_norm = delta.abs().sum(dim=1)
+            outside = l1_norm > radius
+            if outside.any():
+                selected = delta[outside]
+                absolute = selected.abs()
+                sorted_absolute, _ = torch.sort(
+                    absolute,
+                    dim=1,
+                    descending=True,
+                )
+                cumulative = torch.cumsum(
+                    sorted_absolute,
+                    dim=1,
+                )
+                indexes = torch.arange(
+                    1,
+                    selected.shape[1] + 1,
+                    device=feature.device,
+                    dtype=feature.dtype,
+                ).view(1, -1)
+                positive = (
+                    sorted_absolute
+                    - (cumulative - radius) / indexes
+                ) > 0
+                rho = positive.sum(dim=1).clamp_min(1) - 1
+                theta = (
+                    cumulative.gather(1, rho.unsqueeze(1)).squeeze(1)
+                    - radius
+                ) / (rho.to(feature.dtype) + 1)
+                projected = selected.sign() * torch.clamp(
+                    absolute - theta.unsqueeze(1),
+                    min=0,
+                )
+                delta[outside] = projected
+
+            projected_feature = (
+                reference + delta.reshape_as(feature)
+            ).clamp(0.0, 1.0)
+            feature.copy_(projected_feature)
+
+    def _timegan_gifd_gradient_loss(
+        self,
+        model,
+        reconstructed_inputs,
+        dummy_targets,
+        original_dy_dx,
+        config,
+    ):
+        dummy_out = model(reconstructed_inputs)
+        dummy_y = nn.CrossEntropyLoss()(
+            dummy_out,
+            dummy_targets,
+        )
+        dummy_dy_dx = torch.autograd.grad(
+            dummy_y,
+            model.parameters(),
+            create_graph=True,
+        )
+        loss = self.gradient_loss_function(
+            dummy_dy_dx,
+            original_dy_dx,
+            config["gradient_loss"],
+        )
+
+        if config.get("total_variation_alpha_inputs", 0) > 0:
+            loss += (
+                config["total_variation_alpha_inputs"]
+                * total_variation_time_series(reconstructed_inputs)
+            )
+
+        lower_res_weight = config.get(
+            "lower_res_term_inputs",
+            config.get("lower_res_term", 0),
+        )
+        if lower_res_weight > 0:
+            with torch.no_grad():
+                warped_inputs = temporal_resolution_warping(
+                    reconstructed_inputs,
+                    2,
+                )
+                filtered_inputs = interpolate(
+                    warped_inputs,
+                    reconstructed_inputs.shape[1],
+                )
+            loss += lower_res_weight * F.l1_loss(
+                filtered_inputs,
+                reconstructed_inputs,
+            )
+
+        # if config.get("trend_term", 0) > 0:
+        #     loss += (
+        #         config["trend_term"]
+        #         * featurewise_trend_regularization(
+        #             reconstructed_inputs,
+        #             config["trend_loss"],
+        #         )
+        #     )
+
+
+        trend_weights = config.get("trend_term", {})
+
+        if any(weight > 0 for weight in trend_weights.values()):
+            trend_lr_term = 1.0
+
+            loss += (
+                trend_lr_term
+                * featurewise_trend_regularization(
+                    reconstructed_inputs,
+                    config["trend_loss"],
+                    group_weights=trend_weights,
+                )
+            )
+
+        if config.get("periodicity_term", 0) > 0:
+            loss += (
+                config["periodicity_term"]
+                * featurewise_periodicity_regularization(
+                    reconstructed_inputs,
+                    period=int(config["periodicity_period"]),
+                    loss=config["periodicity_loss"],
+                )
+            )
+
+        return loss
+
+    def _log_timegan_gifd_reconstruction(
+        self,
+        config,
+        batch_inputs,
+        batch_targets,
+        reconstructed_inputs,
+        dummy_targets,
+        batch_number,
+        attack_step,
+        loss,
+        extra_metrics,
+    ):
+        metrics = {
+            "step": attack_step,
+            "grad_diff_loss_mse": loss.detach().item(),
+            **extra_metrics,
+        }
+        self.evaluate_and_log_reconstruction(
+            config,
+            batch_inputs,
+            batch_targets,
+            reconstructed_inputs,
+            dummy_targets,
+            batch_number,
+            attack_step,
+            config["num_attack_steps"],
+            metrics,
+            attack_step_offset=config.get(
+                "num_learn_epochs",
+                0,
+            ),
+        )
+
+    def attack_batch_with_timegan_gifd(
+        self,
+        model,
+        config,
+        batch_number,
+        original_dy_dx,
+        dummy_targets,
+        batch_inputs,
+        batch_targets,
+    ):
+        """Optimize TimeGAN noise, then its generated feature sequence.
+
+        The second stage is the recurrent TimeGAN analogue of GIFD feature
+        domain optimization. Its search is constrained to an L1 ball around
+        the feature sequence produced at the end of latent optimization.
+        """
+        if config.get("attack_targets", False):
+            raise ValueError(
+                "TimeGAN GIFD assumes known activity labels; "
+                "set attack_targets=False."
+            )
+
+        latent_steps = int(config["timegan_gifd_latent_steps"])
+        feature_steps = int(config["timegan_gifd_feature_steps"])
+        total_steps = latent_steps + feature_steps
+        if total_steps <= 0:
+            raise ValueError(
+                "At least one TimeGAN GIFD optimization step is required."
+            )
+        if total_steps != config["num_attack_steps"]:
+            raise ValueError(
+                "num_attack_steps must equal TimeGAN latent plus feature "
+                "steps."
+            )
+
+        (
+            prior,
+            timegan_minimum,
+            timegan_range,
+            classifier_mean,
+            classifier_std,
+        ) = self._load_timegan_attack_prior(
+            config,
+            batch_inputs,
+            batch_targets,
+        )
+
+        dummy_targets = (
+            batch_targets.detach().clone().to(batch_inputs.device)
+        )
+        latent = torch.rand(
+            batch_inputs.shape[0],
+            prior.sequence_length,
+            prior.z_dim,
+            dtype=batch_inputs.dtype,
+            device=batch_inputs.device,
+            requires_grad=True,
+        )
+        log_interval = max(
+            1,
+            total_steps // min(total_steps, 200),
+        )
+
+        def decode_normalized(normalized_output):
+            return self._decode_timegan_for_classifier(
+                normalized_output,
+                timegan_minimum,
+                timegan_range,
+                classifier_mean,
+                classifier_std,
+                config["dataset"],
+            )
+
+        latent_optimizer, latent_scheduler = (
+            self.set_attack_optimizer_and_schedular(
+                [latent],
+                config.get(
+                    "timegan_gifd_optimizer",
+                    "adam",
                 ),
+                config["timegan_gifd_latent_learning_rate"],
+                config.get(
+                    "timegan_gifd_lr_decay",
+                    "on_plateau_10",
+                ),
+                max(latent_steps, 1),
+            )
+        )
+        if latent_optimizer is None:
+            raise ValueError(
+                "Unsupported TimeGAN GIFD optimizer: "
+                f"{config.get('timegan_gifd_optimizer')}"
             )
 
-            torch.save(
-                {
-                    "original_data": original_data,
-                    "gender":corresponding_genders,
-                },
-                original_data_path,
+        print(
+            "TimeGAN GIFD stage 1/2: optimizing latent noise for "
+            f"{latent_steps} steps"
+        )
+        for stage_step in range(latent_steps):
+            attack_step = stage_step
+
+            def latent_closure():
+                latent_optimizer.zero_grad()
+                model.zero_grad()
+                reconstructed_inputs = decode_normalized(
+                    prior(latent)
+                )
+                loss = self._timegan_gifd_gradient_loss(
+                    model,
+                    reconstructed_inputs,
+                    dummy_targets,
+                    original_dy_dx,
+                    config,
+                )
+                loss.backward()
+                if config.get(
+                    "timegan_gifd_sign_gradients",
+                    False,
+                ):
+                    latent.grad.sign_()
+                return loss
+
+            loss = latent_optimizer.step(latent_closure)
+            with torch.no_grad():
+                latent.clamp_(0.0, 1.0)
+
+            scheduler_metrics = {}
+            self.schedular_step(
+                config.get(
+                    "timegan_gifd_lr_decay",
+                    "on_plateau_10",
+                ),
+                latent_scheduler,
+                scheduler_metrics,
+                loss,
             )
 
-            print(
-                "Saved original data and gender:",
-                original_data_path,
+            if (
+                attack_step % log_interval == 0
+                or stage_step == latent_steps - 1
+            ):
+                with torch.no_grad():
+                    reconstructed_inputs = decode_normalized(
+                        prior(latent)
+                    )
+                self._log_timegan_gifd_reconstruction(
+                    config,
+                    batch_inputs,
+                    batch_targets,
+                    reconstructed_inputs,
+                    dummy_targets,
+                    batch_number,
+                    attack_step,
+                    loss,
+                    {
+                        "timegan_gifd/stage": 0,
+                        "timegan_gifd/latent_l2": (
+                            latent.detach().square().sum().sqrt().item()
+                        ),
+                        **scheduler_metrics,
+                    },
+                )
+
+        with torch.no_grad():
+            feature_reference = prior.generated_features(
+                latent
+            ).detach()
+        optimized_feature = (
+            feature_reference.clone().requires_grad_(True)
+        )
+        feature_radius = float(
+            config["timegan_gifd_feature_l1_radius"]
+        )
+
+        feature_optimizer, feature_scheduler = (
+            self.set_attack_optimizer_and_schedular(
+                [optimized_feature],
+                config.get(
+                    "timegan_gifd_optimizer",
+                    "adam",
+                ),
+                config[
+                    "timegan_gifd_feature_learning_rate"
+                ],
+                config.get(
+                    "timegan_gifd_lr_decay",
+                    "on_plateau_10",
+                ),
+                max(feature_steps, 1),
             )
+        )
+        if feature_optimizer is None:
+            raise ValueError(
+                "Unsupported TimeGAN GIFD optimizer: "
+                f"{config.get('timegan_gifd_optimizer')}"
+            )
+
+        print(
+            "TimeGAN GIFD stage 2/2: optimizing generated features for "
+            f"{feature_steps} steps inside an L1 ball of radius "
+            f"{feature_radius}"
+        )
+        for stage_step in range(feature_steps):
+            attack_step = latent_steps + stage_step
+
+            def feature_closure():
+                feature_optimizer.zero_grad()
+                model.zero_grad()
+                reconstructed_inputs = decode_normalized(
+                    prior.decode_features(optimized_feature)
+                )
+                loss = self._timegan_gifd_gradient_loss(
+                    model,
+                    reconstructed_inputs,
+                    dummy_targets,
+                    original_dy_dx,
+                    config,
+                )
+                loss.backward()
+                if config.get(
+                    "timegan_gifd_sign_gradients",
+                    False,
+                ):
+                    optimized_feature.grad.sign_()
+                return loss
+
+            loss = feature_optimizer.step(feature_closure)
+            self._project_feature_l1_ball_(
+                optimized_feature,
+                feature_reference,
+                feature_radius,
+            )
+
+            scheduler_metrics = {}
+            self.schedular_step(
+                config.get(
+                    "timegan_gifd_lr_decay",
+                    "on_plateau_10",
+                ),
+                feature_scheduler,
+                scheduler_metrics,
+                loss,
+            )
+
+            if (
+                attack_step % log_interval == 0
+                or stage_step == feature_steps - 1
+            ):
+                with torch.no_grad():
+                    reconstructed_inputs = decode_normalized(
+                        prior.decode_features(optimized_feature)
+                    )
+                    feature_l1 = (
+                        optimized_feature - feature_reference
+                    ).abs().flatten(1).sum(dim=1).mean().item()
+                self._log_timegan_gifd_reconstruction(
+                    config,
+                    batch_inputs,
+                    batch_targets,
+                    reconstructed_inputs,
+                    dummy_targets,
+                    batch_number,
+                    attack_step,
+                    loss,
+                    {
+                        "timegan_gifd/stage": 1,
+                        "timegan_gifd/feature_l1": feature_l1,
+                        **scheduler_metrics,
+                    },
+                )
+
+        with torch.no_grad():
+            if feature_steps > 0:
+                reconstructed_inputs = decode_normalized(
+                    prior.decode_features(optimized_feature)
+                )
+            else:
+                reconstructed_inputs = decode_normalized(
+                    prior(latent)
+                )
+
+        self.all_dummy_inputs[batch_number] = (
+            reconstructed_inputs.detach().clone()
+        )
+        self.all_dummy_targets[batch_number] = (
+            dummy_targets.detach().clone()
+        )
+
+        final_mapping = get_batch_sample_mapping(
+            batch_inputs,
+            reconstructed_inputs,
+        )
+        reconstructed_data = (
+            reconstructed_inputs[final_mapping].detach().cpu()
+        )
+        corresponding_genders = (
+            self.all_batch_genders[batch_number].detach().cpu()
+        )
+        output_directory = config.get(
+            "reconstruction_output_dir",
+            "../data/_reconstructions",
+        )
+        os.makedirs(output_directory, exist_ok=True)
+        output_path = os.path.join(
+            output_directory,
+            (
+                f"{config['dataset']}_reconstruction_"
+                f"run_{config['run_number']}_"
+                f"batch_{batch_number}.pt"
+            ),
+        )
+        torch.save(
+            {
+                "reconstructed_data": reconstructed_data,
+                "gender": corresponding_genders,
+                "attack": "timegan_gifd",
+            },
+            output_path,
+        )
+        print(
+            "Saved TimeGAN GIFD reconstructed data and gender:",
+            output_path,
+        )
 
     def learned_prior_regularization(self, dummy_inputs, dummy_targets, regularization_inputs, regularization_targets, config):
         learned_prior_regularization = torch.zeros(1, device=dummy_inputs.device)
@@ -832,10 +1577,10 @@ class AttackTSInverseWorker(Worker):
                 def out_of_bound_loss(sequence, sequence_quantiles):
                     bound_loss = torch.zeros(1, device=sequence.device)
                     for tau_q in range(sequence_quantiles.shape[-1] // 2):
-                        quantile_upper_bound = sequence_quantiles[..., tau_q].reshape(sequence.shape)
-                        quantile_lower_bound = sequence_quantiles[..., -tau_q - 1].reshape(sequence.shape)
-                        bound_loss += F.relu(sequence - quantile_upper_bound).mean()
+                        quantile_lower_bound = sequence_quantiles[..., tau_q].reshape(sequence.shape)
+                        quantile_upper_bound = sequence_quantiles[..., -tau_q - 1].reshape(sequence.shape)
                         bound_loss += F.relu(quantile_lower_bound - sequence).mean()
+                        bound_loss += F.relu(sequence - quantile_upper_bound).mean()
                     return bound_loss / 2
 
                 if config["inversion_regularization_term_inputs"] > 0:
@@ -848,12 +1593,14 @@ class AttackTSInverseWorker(Worker):
                     )
 
         elif config["inversion_regularization_loss"] == "l1":
-            learned_prior_regularization += config["inversion_regularization_term_inputs"] * F.l1_loss(
-                dummy_inputs, regularization_inputs
-            )
-            learned_prior_regularization += config["inversion_regularization_term_targets"] * F.l1_loss(
-                dummy_targets, regularization_targets
-            )
+            if config["inversion_regularization_term_inputs"] > 0:
+                learned_prior_regularization += config["inversion_regularization_term_inputs"] * F.l1_loss(
+                    dummy_inputs, regularization_inputs
+                )
+            if config["inversion_regularization_term_targets"] > 0:
+                learned_prior_regularization += config["inversion_regularization_term_targets"] * F.l1_loss(
+                    dummy_targets, regularization_targets
+                )
         else:
             raise NotImplementedError(f"Inversion regularization loss not found: {config['inversion_regularization_loss']}")
         return learned_prior_regularization
@@ -880,13 +1627,21 @@ class AttackTSInverseWorker(Worker):
             ).to(config["device"])
         elif config["inversion_model"] == "ImprovedGradToInputNN_Probabilistic":
             inversion_model = ImprovedGradToInputNN_Probabilistic(
-                config["attack_hidden_size"], config["model_size"], input_shape, target_shape, distribution=config["attack_loss"]
+                config["attack_hidden_size"],
+                config["model_size"],
+                data_observations_shape,
+                data_targets_shape,
+                distribution=config["attack_loss"],
             ).to(config["device"])
         elif config["inversion_model"] == "ImprovedGradToInputNN_Quantile":
             inversion_model = ImprovedGradToInputNN_Quantile(
-                config["attack_hidden_size"], config["model_size"], input_shape, target_shape, quantiles=config["quantiles"]
+                config["attack_hidden_size"],
+                config["model_size"],
+                data_observations_shape,
+                data_targets_shape,
+                quantiles=config["quantiles"],
             ).to(config["device"])
-        return inversion_model, input_shape, target_shape
+        return inversion_model, data_observations_shape, data_targets_shape
 
     def calculate_inversion_model_loss(
         self, inversion_model, config, attack_batch_size, predicted_inputs, predicted_targets, aux_inputs, aux_targets
@@ -935,6 +1690,27 @@ class AttackTSInverseWorker(Worker):
             assert predicted_inputs is not None, "Predicted inputs should not be None for quantile loss"
 
             predicted_inputs = predicted_inputs.repeat(1, config["batch_size"] // config["inversion_batch_size"], 1, 1, 1)
+
+            # Activity labels are assumed known for MotionSense and MobiFall.
+            # Their inversion model therefore predicts quantiles for the IMU
+            # input only, unlike forecasting TS-Inverse which also predicts a
+            # future target sequence.
+            if predicted_targets is None:
+                predicted_inputs = predicted_inputs.reshape(
+                    attack_batch_size * config["batch_size"],
+                    -1,
+                    len(config["quantiles"]),
+                )
+                aux_inputs = aux_inputs.reshape(
+                    attack_batch_size * config["batch_size"],
+                    -1,
+                )
+                return pinball_loss(
+                    predicted_inputs,
+                    aux_inputs,
+                    config["quantiles"],
+                )
+
             predicted_targets = predicted_targets.unsqueeze(-2)  # behind quantiles
             predicted_targets = predicted_targets.repeat(1, config["batch_size"] // config["inversion_batch_size"], 1, 1, 1)
             aux_targets = aux_targets.unsqueeze(-1)  # last dimension
@@ -1007,14 +1783,36 @@ class AttackTSInverseWorker(Worker):
                 )
                 dummy_inputs = dummy_quantile_inputs
 
+                def pinball_loss_simple(batch_inputs, dummy_inputs):
+                    return pinball_loss(dummy_inputs, batch_inputs, config["quantiles"])
+
+                if config["dataset"] in {"motionsense", "mobifall"}:
+                    input_sample_mapping = get_batch_sample_mapping(
+                        batch_inputs,
+                        dummy_inputs,
+                        function=pinball_loss_simple,
+                    )
+                    attack_metrics["inputs/pinball/mean"] = (
+                        pinball_loss_simple(
+                            batch_inputs,
+                            dummy_inputs[input_sample_mapping],
+                        ).item()
+                    )
+                    for i, j in enumerate(input_sample_mapping):
+                        attack_metrics[f"inputs/pinball/{i}"] = (
+                            pinball_loss_simple(
+                                batch_inputs[i],
+                                dummy_inputs[j],
+                            ).item()
+                        )
+                    self._log_metrics(attack_metrics, step=epoch)
+                    return
+
                 if predicted_dummy_quantile_targets is not None:
                     dummy_quantile_targets = predicted_dummy_quantile_targets.squeeze(0).repeat(
                         batch_targets.shape[0] // config["inversion_batch_size"], 1, 1
                     )
                     dummy_targets = dummy_quantile_targets
-
-                def pinball_loss_simple(batch_inputs, dummy_inputs):
-                    return pinball_loss(dummy_inputs, batch_inputs, config["quantiles"])
 
                 standard_mapping = np.arange(0, batch_inputs.shape[0])
                 input_sample_mapping = get_batch_sample_mapping(batch_inputs, dummy_inputs, function=pinball_loss_simple)
@@ -1102,9 +1900,15 @@ class AttackTSInverseWorker(Worker):
             aux_inputs = aux_inputs.view(batch_size, config["batch_size"], *aux_inputs.shape[-2:])
             aux_targets = aux_targets.view(batch_size, config["batch_size"], *aux_targets.shape[-1:])  # Only 1 feature
 
-            if aux_inputs.min() < 0 or aux_inputs.max() > 1:
+            if (
+                config["dataset"] not in CLASSIFICATION_DATASETS
+                and (aux_inputs.min() < 0 or aux_inputs.max() > 1)
+            ):
                 print("Aux inputs out of range:", aux_inputs.min(), aux_inputs.max())
-            if aux_targets.min() < 0 or aux_targets.max() > 1:
+            if (
+                config["dataset"] not in CLASSIFICATION_DATASETS
+                and (aux_targets.min() < 0 or aux_targets.max() > 1)
+            ):
                 print("Aux targets out of range:", aux_targets.min(), aux_targets.max())
 
             predicted_inputs, predicted_targets = inversion_model(aux_grads)
@@ -1857,7 +2661,7 @@ class AttackTSInverseWorker(Worker):
                 self._log_matplotlib_figure(fig, step=attack_step + attack_step_offset, log_name=f"_batch_{batch_number}")
 
             # Changes number of steps before new plots are logged for the MotionSense data
-            elif dataset_name == "motionsense" and attack_step % (num_attack_steps // log_plots_n_times) == 0:
+            elif attack_step % (num_attack_steps // log_plots_n_times) == 0:
                 for sample_idx in range(batch_inputs.shape[0]):
                     df, fig = plot_channel_grid_original_vs_reconstructed(
                         config, sample_mapping, dummy_inputs, batch_inputs, batch_number, sample_idx=sample_idx
@@ -2098,10 +2902,16 @@ def create_gradient_inversion_dataloader(
     aux_dataloader, model, config, batch_number, dummy_inputs, dummy_targets, seed_generator=None
 ):
     model.to(config["device"])
+    model.eval()
 
     folder_path = "../data/_model_dataset_gradients/"
+    task_kind = (
+        "classification_ce_v1"
+        if config["dataset"] in CLASSIFICATION_DATASETS
+        else "forecasting_mse_v1"
+    )
     # Path where the dataset will be saved or loaded from
-    dataset_path = f"{folder_path}grad_inputs_targets_dataset_{config['defense_name']}_{batch_number}_{model.name}_{'-'.join(map(str, model.features))}_{config['dataset']}_{len(aux_dataloader.dataset)}_{config['input_size']}_{config['output_size']}_{config['seed']}_{config['inversion_batch_size']}.pt"
+    dataset_path = f"{folder_path}grad_inputs_targets_dataset_{config.get('defense_name', 'none')}_{task_kind}_{batch_number}_{model.name}_{'-'.join(map(str, model.features))}_{config['dataset']}_{len(aux_dataloader.dataset)}_{config['input_size']}_{config['output_size']}_{config['seed']}_{config['inversion_batch_size']}.pt"
 
     # Check if the dataset file exists and load file
     if os.path.exists(dataset_path):
@@ -2114,29 +2924,62 @@ def create_gradient_inversion_dataloader(
         config["loaded_grad_to_inputs_targets_dataset_from_file"] = False
         aux_dy_dx_inputs, aux_inputs_targets, aux_targets_targets = [], [], []
         for i, (aux_batch_inputs, aux_batch_targets) in enumerate(aux_dataloader):
-            aux_batch_inputs, aux_batch_targets = (
-                aux_batch_inputs[:, :, model.features].to(config["device"]),
-                aux_batch_targets[:, :, 0].to(config["device"]),
-            )
+            if aux_batch_inputs.ndim != 3:
+                raise ValueError(
+                    "Auxiliary MotionSense/MobiFall inputs must have shape "
+                    "[batch, time, features]; received "
+                    f"{tuple(aux_batch_inputs.shape)}"
+                )
+            aux_batch_inputs = aux_batch_inputs[
+                :, :, model.features
+            ].to(config["device"])
 
             if aux_batch_inputs.shape[1] != dummy_inputs.shape[1]:
                 aux_batch_inputs = interpolate(aux_batch_inputs, dummy_inputs.shape[1])
-            if aux_batch_targets.shape[1] != dummy_targets.shape[1]:
-                aux_batch_targets = interpolate(aux_batch_targets.unsqueeze(-1), dummy_targets.shape[1]).squeeze(-1)
 
-            model.zero_grad()
-            aux_out = model(aux_batch_inputs)
-            aux_y = F.mse_loss(aux_out, aux_batch_targets)
+            model.zero_grad(set_to_none=True)
+
+            if config["dataset"] in CLASSIFICATION_DATASETS:
+                aux_batch_targets = aux_batch_targets.reshape(-1).to(
+                    config["device"],
+                    dtype=torch.long,
+                )
+                if aux_batch_targets.numel() != aux_batch_inputs.shape[0]:
+                    raise ValueError(
+                        "Expected one activity label per auxiliary window; "
+                        f"received inputs {tuple(aux_batch_inputs.shape)} "
+                        f"and labels {tuple(aux_batch_targets.shape)}"
+                    )
+                aux_logits = model(aux_batch_inputs)
+                aux_y = F.cross_entropy(
+                    aux_logits,
+                    aux_batch_targets,
+                )
+            else:
+                aux_batch_targets = aux_batch_targets[
+                    :, :, 0
+                ].to(config["device"])
+                if aux_batch_targets.shape[1] != dummy_targets.shape[1]:
+                    aux_batch_targets = interpolate(
+                        aux_batch_targets.unsqueeze(-1),
+                        dummy_targets.shape[1],
+                    ).squeeze(-1)
+                aux_out = model(aux_batch_inputs)
+                aux_y = F.mse_loss(aux_out, aux_batch_targets)
+
             aux_y.backward()
 
-            if "defense_name" in config:
+            if config.get("defense_name", "none") not in {
+                None,
+                "none",
+            }:
                 # Apply gradient defenses
                 gradients = [param.grad for param in model.parameters()]
-                if "sign" in config:
+                if config.get("sign", False):
                     gradients = apply_sign_transformation(gradients)
-                if "prune_rate" in config:
+                if config.get("prune_rate") is not None:
                     gradients = apply_pruning(gradients, config["prune_rate"])
-                if "dp_epsilon" in config:
+                if config.get("dp_epsilon", 0) > 0:
                     gradients = add_gaussian_noise(gradients, config["dp_epsilon"])
 
                 # Update model parameters with modified gradients
@@ -2309,6 +3152,8 @@ def featurewise_trend_regularization(x, loss, group_weights=None):
             continue
         for b in range(x.shape[0]):
             for feature in feature_indices:
+                if feature >= x.shape[2]:
+                    continue
                 weighted_losses.append(weight * trend_consistency_regularization(x[b : b + 1, :, feature], loss))
 
     if not weighted_losses:
