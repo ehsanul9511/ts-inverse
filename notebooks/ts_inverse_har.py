@@ -12,7 +12,8 @@ import os
 username = os.getenv("USER")
 
 data_path_dict = {
-    "ejk5818": "/scratch/ejk5818/ts-inverse/data/motion-sense/",
+    # "ejk5818": "/scratch/ejk5818/ts-inverse/data/motion-sense/",
+    "ejk5818": "/scratch/ejk5818/ts-inverse/data/ETT-small/",
     "ddl5280": "/scratch/ddl5280/research/ts-inverse/data/ETT-small/",
 }
 
