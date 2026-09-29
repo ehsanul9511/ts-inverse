@@ -44,6 +44,8 @@ CLASSIFICATION_DATASETS = {
     "motionsense",
 }
 
+ETT_DATASETS = ["ETTh1", "ETTh2", "ETTm1", "ETTm2"]
+
 FEATURE_NAMES = [
     "acc_x", "acc_y", "acc_z",
     "gyro_x", "gyro_y", "gyro_z",
@@ -84,7 +86,7 @@ class AttackTSInverseWorker(Worker):
             )
             print("Loaded MotionSense activity dataset")
         
-        elif dataset_name in {"ETTh1", "ETTh2", "ETTm1", "ETTm2"}:
+        elif dataset_name in ETT_DATASETS:
             self.train_datasets, self.val_datasets, self.test_datasets = (
                 get_ett_dataset(
                     dataset=dataset_name,
@@ -140,11 +142,19 @@ class AttackTSInverseWorker(Worker):
             worker_init_fn=seed_worker,
             generator=self.g,
         )
-        self.inputs_mean, self.inputs_std, self.targets_mean, self.targets_std = get_mean_std_dataloader(
-            mean_std_dataloader, c["device"]
+
+        (
+            self.inputs_mean,
+            self.inputs_std,
+            self.targets_mean,
+            self.targets_std,
+        ) = get_mean_std_dataloader(
+            mean_std_dataloader,
+            c["device"],
+            target_length=self.train_datasets[0].pred_len if dataset_name in ETT_DATASETS else None
         )
 
-        if dataset_name in {"realworld", "ETTh1", "ETTh2", "ETTm1", "ETTm2"}:
+        if dataset_name in {"realworld", *ETT_DATASETS}:
             model = final_model_settings["_model"]()
 
         elif dataset_name == "motionsense":
@@ -208,6 +218,22 @@ class AttackTSInverseWorker(Worker):
             self.train_model_and_record(model, tr_dataloader, config)
         )
 
+        if config["verbose"]:
+            print(
+                f"Recorded {len(self.all_batch_inputs)} gradient batches for attack."
+            )
+            print(
+                f"Batch input shape: {self.all_batch_inputs[0].shape}, "
+                f"Batch target shape: {self.all_batch_targets[0].shape}"
+            )
+            print(
+                f"Model state dict keys: {list(self.all_model_state_dicts[0].keys())}"
+            )
+            print(
+                f"Model gradient shapes: {[g.shape for g in self.all_model_gradients[0]]}"
+            )
+
+
         number_of_attacks = config["attack_number_of_batches"]
 
         if number_of_attacks > len(self.all_batch_inputs):
@@ -234,9 +260,23 @@ class AttackTSInverseWorker(Worker):
             self.all_dummy_targets.append(dummy_targets[0])
 
         dataset_name = config["dataset"]
-        if dataset_name not in CLASSIFICATION_DATASETS:
-            self.inputs_mean, self.inputs_std = self.inputs_mean[model.features], self.inputs_std[model.features]
-            self.targets_mean, self.targets_std = self.targets_mean[0], self.targets_std[0]
+
+        if dataset_name in ETT_DATASETS:
+            # ETT uses all input channels.
+            # For M/S, retain all target statistics already calculated.
+            if config.get("features", "M") == "MS":
+                self.targets_mean = self.targets_mean[-1:]
+                self.targets_std = self.targets_std[-1:]
+
+        elif dataset_name not in CLASSIFICATION_DATASETS:
+            self.inputs_mean, self.inputs_std = (
+                self.inputs_mean[model.features],
+                self.inputs_std[model.features],
+            )
+            self.targets_mean, self.targets_std = (
+                self.targets_mean[0],
+                self.targets_std[0],
+            )
         config["model_size"] = sum(p.numel() for p in model.parameters())
 
         if "aux_dataset" in config and config["aux_dataset"] is not None:
@@ -291,7 +331,7 @@ class AttackTSInverseWorker(Worker):
 
         self._update_config(config)
 
-        if config["verbose"]:
+        if config["verbose"] and config["aux_dataset"] is not None:
             print("Loaded auxiliary dataset with", len(self.aux_gi_t_dataset), "samples")
             print("Sample size:", self.aux_gi_t_dataset[0][0].shape, self.aux_gi_t_dataset[0][1].shape)
             print("Model / gradient size:", config["model_size"])
@@ -2179,6 +2219,205 @@ class AttackTSInverseWorker(Worker):
                     optimizer.step()
 
                 total_batches_processed += 1
+
+        elif dataset in ETT_DATASETS:
+            pred_len = self.train_datasets[0].pred_len
+            label_len = self.train_datasets[0].label_len
+            feature_mode = self.train_datasets[0].features
+            f_dim = -1 if feature_mode == "MS" else 0
+
+            model_train_epochs = config.get("model_train_epochs", 10)
+            number_of_batches = config["number_of_batches"]
+
+            if len(tr_dataloader) == 0:
+                raise ValueError("The ETT dataloader is empty.")
+
+            if number_of_batches > len(tr_dataloader):
+                raise ValueError(
+                    f"Requested {number_of_batches} gradient batches, "
+                    f"but the ETT dataloader contains "
+                    f"{len(tr_dataloader)} batches."
+                )
+
+            model_train_loader = DataLoader(
+                tr_dataloader.dataset,
+                batch_size=config.get("model_train_batch_size", 32),
+                shuffle=True,
+                worker_init_fn=seed_worker,
+                generator=self.g,
+            )
+
+            optimizer = torch.optim.Adam(
+                model.parameters(),
+                lr=config.get("model_train_learning_rate", 1e-4),
+            )
+
+            loss_function = nn.MSELoss()
+
+            # Train the forecasting model.
+            for epoch in range(model_train_epochs):
+                model.train()
+
+                epoch_squared_error = 0.0
+                epoch_target_elements = 0
+
+                for batch_x, batch_y, batch_x_mark, batch_y_mark in model_train_loader:
+                    batch_x = batch_x.float().to(config["device"])
+                    batch_y = batch_y.float().to(config["device"])
+                    batch_x_mark = batch_x_mark.float().to(config["device"])
+                    batch_y_mark = batch_y_mark.float().to(config["device"])
+
+                    dec_inp = torch.cat(
+                        [
+                            batch_y[:, :label_len, :],
+                            torch.zeros_like(batch_y[:, -pred_len:, :]),
+                        ],
+                        dim=1,
+                    )
+
+                    optimizer.zero_grad(set_to_none=True)
+
+                    outputs = model(
+                        batch_x,
+                        batch_x_mark,
+                        dec_inp,
+                        batch_y_mark,
+                    )
+                    if isinstance(outputs, tuple):
+                        outputs = outputs[0]
+
+                    outputs = outputs[:, -pred_len:, f_dim:]
+                    targets = batch_y[:, -pred_len:, f_dim:]
+
+                    if outputs.shape != targets.shape:
+                        raise ValueError(
+                            f"ETT output shape {tuple(outputs.shape)} "
+                            f"does not match target shape {tuple(targets.shape)}."
+                        )
+
+                    loss = loss_function(outputs, targets)
+                    loss.backward()
+                    optimizer.step()
+
+                    epoch_squared_error += loss.item() * targets.numel()
+                    epoch_target_elements += targets.numel()
+
+                print(
+                    f"ETT epoch {epoch + 1:02d}/{model_train_epochs} | "
+                    f"MSE {epoch_squared_error / epoch_target_elements:.6f}"
+                )
+
+            # Record deterministic gradients, with dropout disabled.
+            # Reconstruction must also use model.eval().
+            model.eval()
+
+            self.all_batch_input_marks = []
+            self.all_batch_target_marks = []
+
+            for batch_number, batch in enumerate(tr_dataloader):
+                if batch_number >= number_of_batches:
+                    break
+
+                batch_x, batch_y, batch_x_mark, batch_y_mark = batch
+                batch_x = batch_x.float().to(config["device"])
+                batch_y = batch_y.float().to(config["device"])
+                batch_x_mark = batch_x_mark.float().to(config["device"])
+                batch_y_mark = batch_y_mark.float().to(config["device"])
+
+                dec_inp = torch.cat(
+                    [
+                        batch_y[:, :label_len, :],
+                        torch.zeros_like(batch_y[:, -pred_len:, :]),
+                    ],
+                    dim=1,
+                )
+
+                state_before = {
+                    name: value.detach().clone()
+                    for name, value in model.state_dict().items()
+                }
+
+                model.zero_grad(set_to_none=True)
+
+                outputs = model(
+                    batch_x,
+                    batch_x_mark,
+                    dec_inp,
+                    batch_y_mark,
+                )
+                if isinstance(outputs, tuple):
+                    outputs = outputs[0]
+
+                outputs = outputs[:, -pred_len:, f_dim:]
+                targets = batch_y[:, -pred_len:, f_dim:]
+
+                if outputs.shape != targets.shape:
+                    raise ValueError(
+                        f"ETT output shape {tuple(outputs.shape)} "
+                        f"does not match target shape {tuple(targets.shape)}."
+                    )
+
+                loss = loss_function(outputs, targets)
+                loss.backward()
+
+                # Preserve model.parameters() ordering. Do not silently
+                # skip parameters or replace missing gradients with zeros.
+                gradients = []
+                for name, parameter in model.named_parameters():
+                    if parameter.grad is None:
+                        raise RuntimeError(
+                            f"No gradient recorded for parameter {name!r}: "
+                            f"shape={tuple(parameter.shape)}, "
+                            f"requires_grad={parameter.requires_grad}. "
+                            "Inspect why this parameter has no gradient "
+                            "before continuing the experiment."
+                        )
+                    if not torch.isfinite(parameter.grad).all():
+                        raise RuntimeError(
+                            f"Non-finite gradient recorded for parameter {name!r}."
+                        )
+                    gradients.append(parameter.grad.detach().clone())
+
+                # Apply configured defenses only after checking raw gradients.
+                if config.get("defense_name", "none") not in {None, "none"}:
+                    if config.get("sign", False):
+                        gradients = apply_sign_transformation(gradients)
+                    if config.get("prune_rate") is not None:
+                        gradients = apply_pruning(
+                            gradients, config["prune_rate"]
+                        )
+                    if config.get("dp_epsilon", 0) > 0:
+                        gradients = add_gaussian_noise(
+                            gradients, config["dp_epsilon"]
+                        )
+
+                all_batch_inputs.append(batch_x.detach().clone())
+                all_batch_targets.append(targets.detach().clone())
+                all_model_state_dicts.append(state_before)
+                all_model_gradients.append(
+                    [gradient.detach().clone() for gradient in gradients]
+                )
+
+                self.all_batch_input_marks.append(
+                    batch_x_mark.detach().clone()
+                )
+                self.all_batch_target_marks.append(
+                    batch_y_mark.detach().clone()
+                )
+
+                if config["update_model"]:
+                    for parameter, gradient in zip(
+                        model.parameters(), gradients
+                    ):
+                        parameter.grad = gradient.detach().clone()
+                    optimizer.step()
+
+                all_model_updates.append(
+                    [
+                        (value - state_before[name]).detach().clone()
+                        for name, value in model.state_dict().items()
+                    ]
+                )
         else:
             model_optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
 

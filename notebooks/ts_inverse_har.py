@@ -199,7 +199,7 @@ global_config = {
     'seed': [43], # 28, 80, 71],
     'batch_size': 1,
     'device': 'cpu',
-    'verbose': False,
+    'verbose': True,
     'pool_size': 1,
     'run_number': -1,
     'total_variation_alpha_inputs': 0.025, 
