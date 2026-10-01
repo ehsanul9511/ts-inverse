@@ -246,7 +246,7 @@ attack_config = [
         'timegan_gifd_lr_decay': 'on_plateau_10',
         'timegan_gifd_sign_gradients': False,
         # invert attack
-        'num_learn_epochs': 50,
+        'num_learn_epochs': 0,
         'learn_learning_rate': 1e-3, 
         'attack_batch_size': 32,
         'inversion_batch_size': 1, # global_config['batch_size'],
@@ -267,12 +267,13 @@ attack_config = [
 
         'lower_res_term': [0],
         "lower_res_term_inputs": [0.0],
-        'trend_term': [{
-            'acc': 0.19,
-            'gyro': 0.19,
-            'gravity': 0.01,
-            'rot_rate': 0.01,
-        }],
+        # 'trend_term': [{
+        #     'acc': 0.19,
+        #     'gyro': 0.19,
+        #     'gravity': 0.01,
+        #     'rot_rate': 0.01,
+        # }],
+        'trend_term': [0.1],
         'trend_loss': ['l1_mean'],
         'trend_reduce_lr': [False],
         'periodicity_term': [0.1],
