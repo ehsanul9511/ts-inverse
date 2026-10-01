@@ -432,8 +432,9 @@ class AttackTSInverseWorker(Worker):
             # and victim model weights. For now, assume one fixed setup per dataset.
             model_path = generate_model_path(config, folder_path)
             if os.path.exists(model_path) and config["load_lti_model"]:
+                print(f"Loading inversion model from file: {model_path}")
                 inversion_model.load_state_dict(torch.load(model_path))
-                print("Loaded inversion model to file.")
+                print(f"Loaded inversion model to file: {model_path}")
             else:
 
                 for epoch in tqdm(range(config["num_learn_epochs"])):
@@ -446,18 +447,18 @@ class AttackTSInverseWorker(Worker):
 
                     self.schedular_step(config["learn_lr_decay"], lr_schedular, attack_metrics, np.mean(epoch_v_loss))
 
-                    self.evaluate_dummy_prediction(
-                        config,
-                        batch_number,
-                        original_dy_dx,
-                        batch_inputs,
-                        batch_targets,
-                        dummy_inputs,
-                        dummy_targets,
-                        inversion_model,
-                        epoch,
-                        attack_metrics,
-                    )
+                    # self.evaluate_dummy_prediction(
+                    #     config,
+                    #     batch_number,
+                    #     original_dy_dx,
+                    #     batch_inputs,
+                    #     batch_targets,
+                    #     dummy_inputs,
+                    #     dummy_targets,
+                    #     inversion_model,
+                    #     epoch,
+                    #     attack_metrics,
+                    # )
                 torch.save(inversion_model.state_dict(), model_path)
                 print(f"Saved inversion model to file: {model_path}")
 
@@ -3632,8 +3633,34 @@ def plot_quantile_dummy_data(config, sample_mapping, dummy_quantile_inputs, dumm
 
         # Plotting quantiles for dummy targets
         for q in range(num_quantiles):
-            dummy_target_quantiles = dummy_quantile_targets[j, :, q].detach().cpu().numpy()
-            ax.plot(original_x_axis[batch_inputs.shape[1] :], dummy_target_quantiles, label=f"Dummy Target Quantile {q} ({j})")
+            if config["dataset"] in ETT_DATASETS:
+                for feature in range(dummy_quantile_targets.shape[2]):
+                    dummy_target_quantiles = (
+                        dummy_quantile_targets[j, :, feature, q]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    ax.plot(
+                        original_x_axis[batch_inputs.shape[1]:],
+                        dummy_target_quantiles,
+                        label=(
+                            f"Dummy Target Feature {feature} "
+                            f"Quantile {q} ({j})"
+                        ),
+                    )
+            else:
+                dummy_target_quantiles = (
+                    dummy_quantile_targets[j, :, q]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+                ax.plot(
+                    original_x_axis[batch_inputs.shape[1]:],
+                    dummy_target_quantiles,
+                    label=f"Dummy Target Quantile {q} ({j})",
+                )
 
         ax.set_xlabel("Time" if i == batch_size - 1 else "")
         ax.set_ylabel("Output")
@@ -3645,6 +3672,53 @@ def plot_quantile_dummy_data(config, sample_mapping, dummy_quantile_inputs, dumm
     # Create weights and biases plot & dataframe
     fill_nan = np.empty(batch_targets.shape[1])
     fill_nan.fill(np.nan)
+    if config["dataset"] in ETT_DATASETS:
+        batch_targets_dict = {
+            f"batch_targets_{i}_{feature}": np.concatenate(
+                (
+                    fill_nan,
+                    batch_targets[i, :, feature].detach().cpu().numpy(),
+                )
+            )
+            for i in range(batch_targets.shape[0])
+            for feature in range(batch_targets.shape[2])
+        }
+
+        dummy_quantile_targets_dict = {
+            f"dummy_quantile_targets_{i}_{feature}_{q}": np.concatenate(
+                (
+                    fill_nan,
+                    dummy_quantile_targets[i, :, feature, q]
+                    .detach()
+                    .cpu()
+                    .numpy(),
+                )
+            )
+            for i in range(dummy_quantile_targets.shape[0])
+            for feature in range(dummy_quantile_targets.shape[2])
+            for q in range(dummy_quantile_targets.shape[3])
+        }
+    else:
+        batch_targets_dict = {
+            f"batch_targets_{i}": np.concatenate(
+                (
+                    fill_nan,
+                    batch_targets[i, :].detach().cpu().numpy(),
+                )
+            )
+            for i in range(batch_targets.shape[0])
+        }
+
+        dummy_quantile_targets_dict = {
+            f"dummy_quantile_targets_{i}_{q}": np.concatenate(
+                (
+                    fill_nan,
+                    dummy_quantile_targets[i, :, q].detach().cpu().numpy(),
+                )
+            )
+            for i in range(dummy_quantile_targets.shape[0])
+            for q in range(dummy_quantile_targets.shape[2])
+        }
     if len(batch_inputs.shape) == 3:
         batch_inputs_dict = {
             f"batch_inputs_{i}_{f}": np.concatenate((batch_inputs[i, :, f].detach().cpu().numpy(), fill_nan))

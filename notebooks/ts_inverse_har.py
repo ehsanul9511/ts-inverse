@@ -216,7 +216,7 @@ global_config = {
     'dropout_probability_regularizer': 0,
     'dummy_init_method': 'rand',
 
-    "model_train_epochs": 5,
+    "model_train_epochs": 0,
     "model_train_batch_size": 64,
     "model_train_learning_rate": 1e-3,
 
@@ -246,7 +246,7 @@ attack_config = [
         'timegan_gifd_lr_decay': 'on_plateau_10',
         'timegan_gifd_sign_gradients': False,
         # invert attack
-        'num_learn_epochs': 0,
+        'num_learn_epochs': 1,
         'learn_learning_rate': 1e-3, 
         'attack_batch_size': 32,
         'inversion_batch_size': 1, # global_config['batch_size'],
@@ -254,7 +254,7 @@ attack_config = [
         'quantiles': [[0.1, 0.3, 0.7, 0.9]],
         'attack_loss': ['quantile'],
         'inversion_model': 'ImprovedGradToInputNN_Quantile', 
-        'attack_targets': False,
+        'attack_targets': True,
         'learn_optimizer': 'adamW',
         'learn_lr_decay': ['on_plateau'],
         'aux_dataset': None,
