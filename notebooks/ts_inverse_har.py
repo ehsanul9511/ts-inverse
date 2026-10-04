@@ -283,9 +283,10 @@ attack_config = [
 
         ## Optimization attack
         'gradient_loss': ['l1'], 
-        'base_num_attack_steps': 500,
+        'base_num_attack_steps': 2000,
         # 'after_effect': 'clamp_2',
-        'after_effect': 'none',
+        "perturbation_space": ["dct"],
+        "after_effect": "none",
         'optimization_learning_rate': 0.01, 
         'attack_opti_optimizer': ['adam'],
         'attack_opti_lr_decay': ['on_plateau_10'],
@@ -294,7 +295,7 @@ attack_config = [
         'clamp_dropout_min_max': [[0.0, 1.0]],
         'dropout_probability_regularizer': [1e-5], #1e-6, 1e-7, 1e-8],
         'dropout_mask_init_type': 'halves', #['bernoulli', 'halves', 'uniform', 'p', '1-p'], #['halves', 'bernoulli'],
-        'grad_signs_for_inputs': True,
+        'grad_signs_for_inputs': False,
         'grad_signs_for_targets': False,
         'grad_signs_for_dropouts': True, #[False, True],
 

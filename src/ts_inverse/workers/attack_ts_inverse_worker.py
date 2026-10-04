@@ -532,14 +532,35 @@ class AttackTSInverseWorker(Worker):
                         regularization_targets.clone().requires_grad_(True)
                     )
 
-        optimization_space = [dummy_inputs]
+        perturbation_space = config.get("perturbation_space", "time")
 
-        if config["attack_targets"] and (
+        if (
+            perturbation_space == "dct"
+            and config.get("after_effect", "none") != "none"
+        ):
+            raise ValueError(
+                "DCT optimization currently requires after_effect='none'. "
+                "Time-domain clamping would require updating the "
+                "optimized coefficients as well."
+            )
+
+        optimize_targets = config["attack_targets"] and (
             config["dataset"] in ETT_DATASETS
             or config["batch_size"] > 1
             or not config["one_shot_targets"]
-        ):
-            optimization_space.append(dummy_targets)
+        )
+
+        input_variable, decode_inputs = prepare_attack_variable(
+            dummy_inputs, perturbation_space
+        )
+        optimization_space = [input_variable]
+
+        target_variable = dummy_targets
+        if optimize_targets:
+            target_variable, decode_targets = prepare_attack_variable(
+                dummy_targets, perturbation_space
+            )
+            optimization_space.append(target_variable)
 
         dummy_optimizer, dummy_schedular = self.set_attack_optimizer_and_schedular(
             optimization_space,
@@ -560,8 +581,16 @@ class AttackTSInverseWorker(Worker):
             }
 
             def closure():
+                nonlocal dummy_inputs, dummy_targets
+
                 dummy_optimizer.zero_grad()
                 model.zero_grad()
+
+                if perturbation_space == "dct":
+                    dummy_inputs = decode_inputs(input_variable)
+                    if optimize_targets:
+                        dummy_targets = decode_targets(target_variable)
+
                 zero_loss = dummy_inputs.new_zeros(())
                 loss_components = {
                     "gradient_matching": zero_loss,
@@ -639,7 +668,7 @@ class AttackTSInverseWorker(Worker):
 
                 if attack_step >= config["num_attack_steps"]:
                     grad_dict, fig = self.plot_gradients(dummy_dy_dx, original_dy_dx, config)
-                    attack_metrics.update(grad_dict)
+                    # attack_metrics.update(grad_dict)
                     self._log_matplotlib_figure(
                         fig, attack_step + config["num_learn_epochs"], log_name="gradients", matplotlib_only=True
                     )
@@ -918,20 +947,20 @@ class AttackTSInverseWorker(Worker):
                 total_loss.backward()
 
                 if config["grad_signs_for_inputs"]:
-                    dummy_inputs.grad.sign_()
+                    input_variable.grad.sign_()
                 if config["dataset"] in ETT_DATASETS:
                     if (
                         config["attack_targets"]
                         and config["grad_signs_for_targets"]
                     ):
-                        if dummy_targets.grad is None:
+                        if target_variable.grad is None:
                             raise RuntimeError(
                                 "ETT target optimization is enabled, "
-                                "but dummy_targets has no gradient."
+                                "but target_variable has no gradient."
                             )
-                        dummy_targets.grad.sign_()
+                        target_variable.grad.sign_()
                 elif config["grad_signs_for_targets"]:
-                    dummy_targets.grad.sign_()
+                    target_variable.grad.sign_()
                 if (
                     "TCN" in model.name
                     and config["optimize_dropout"]
@@ -976,6 +1005,12 @@ class AttackTSInverseWorker(Worker):
             attack_metrics["grad_diff_loss_mse"] = (
                 loss_components["gradient_matching"].item()
             )
+
+            if perturbation_space == "dct":
+                with torch.no_grad():
+                    dummy_inputs = decode_inputs(input_variable)
+                    if optimize_targets:
+                        dummy_targets = decode_targets(target_variable)
 
             self.after_effect(config, model, dummy_inputs, dummy_targets, attack_step)
 
@@ -3125,6 +3160,9 @@ class AttackTSInverseWorker(Worker):
                     )
             self._log_metrics(attack_metrics, step=attack_step + attack_step_offset)
 
+            if config["verbose"]:
+                print(f"Attack Step {attack_step + attack_step_offset}: {attack_metrics}")
+
     def plot_gradients(self, dummy_dy_dx, original_dy_dx, config):
         """Plot all gradients along the x-axis as bars. The goal is to show the values"""
         fig, axes = plt.subplots(1, 3, figsize=(10, 3))
@@ -3204,6 +3242,54 @@ class AttackTSInverseWorker(Worker):
                     dummy_inputs.data = torch.clamp(dummy_inputs, 0)
                     dummy_targets.data = torch.clamp(dummy_targets, 0)
 
+def prepare_attack_variable(x, space="time"):
+    """Return an optimizer variable and a differentiable decoder.
+
+    x: [batch, time] or [batch, time, features].
+    The transform acts only along the time dimension.
+    """
+    if space == "time":
+        # Preserve the existing tensor and optimization behavior.
+        return x, lambda value: value
+
+    if space != "dct":
+        raise ValueError(f"Unknown perturbation_space: {space!r}")
+
+    if x.ndim not in (2, 3) or not x.is_floating_point():
+        raise ValueError(
+            "DCT requires floating-point data shaped "
+            "[batch, time] or [batch, time, features]."
+        )
+
+    length = x.shape[1]
+    if length == 0:
+        raise ValueError("Cannot transform an empty time dimension.")
+
+    # Orthonormal DCT-II matrix: basis[frequency, time].
+    frequencies = torch.arange(
+        length, device=x.device, dtype=x.dtype
+    ).unsqueeze(1)
+    times = torch.arange(
+        length, device=x.device, dtype=x.dtype
+    ).unsqueeze(0)
+
+    basis = torch.cos(
+        (torch.pi / length) * frequencies * (times + 0.5)
+    )
+    basis = basis * (2.0 / length) ** 0.5
+    basis[0] = basis[0] / (2.0 ** 0.5)
+
+    # Initialize coefficients from the existing dummy initialization.
+    coefficients = (
+        x.detach().movedim(1, -1) @ basis.T
+    ).movedim(-1, 1).contiguous().requires_grad_(True)
+
+    def decode(value):
+        return (
+            value.movedim(1, -1) @ basis
+        ).movedim(-1, 1).contiguous()
+
+    return coefficients, decode
 
 def plot_original_and_dummy_data(config, sample_mapping, dummy_inputs, dummy_targets, batch_inputs, batch_targets):
     batch_size = batch_inputs.shape[0]
