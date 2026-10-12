@@ -7,6 +7,7 @@ import torch.nn as nn
 import psutil
 
 from ts_inverse.models.iTransformer import Model as iTransformer
+from ts_inverse.models.Transformer import Model as Transformer
 
 import os
 username = os.getenv("USER")
@@ -197,8 +198,8 @@ global_config = {
     'experiment_name': 'ts-inverse_batch1_without_target_reconst_12-6-2024',
     # 'seed': [10, 43, 28, 80, 71], # 28, 80, 71],
     'seed': [43], # 28, 80, 71],
-    'batch_size': 1,
-    'device': 'cpu',
+    'batch_size': [1, 2, 4, 8, 16, 32, 64][:1],
+    'device': 'cuda',
     'verbose': True,
     'pool_size': 1,
     'run_number': -1,
@@ -283,7 +284,7 @@ attack_config = [
 
         ## Optimization attack
         'gradient_loss': ['l1'], 
-        'base_num_attack_steps': 2000,
+        'base_num_attack_steps': 10000,
         # 'after_effect': 'clamp_2',
         "perturbation_space": ["dct"],
         "after_effect": "none",
@@ -328,7 +329,8 @@ dataset_config = [
 
 model_config = [
     {
-        "_model": iTransformer,
+        # "_model": iTransformer,
+        "_model": Transformer,
         "_attack_step_multiplier": 10,
     }
 ]

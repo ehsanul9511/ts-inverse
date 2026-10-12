@@ -277,7 +277,10 @@ class AttackTSInverseWorker(Worker):
                 self.targets_mean[0],
                 self.targets_std[0],
             )
-        config["model_size"] = sum(p.numel() for p in model.parameters())
+        config["model_size"] = sum(
+            p.numel() for p in model.parameters()
+            if config["dataset"] not in ETT_DATASETS or p.requires_grad
+        )
 
         if "aux_dataset" in config and config["aux_dataset"] is not None:
             aux_dataset_config = config["aux_dataset"]
@@ -418,11 +421,14 @@ class AttackTSInverseWorker(Worker):
                 ]
                 dataset_name = config["dataset"]
 
+                model_name = config["model"]
+
                 path_components = [
                     folder_path,
                     "grad_inputs_targets_model",
                     # str(batch_number),
                     dataset_name,
+                    model_name,
                 ]
 
                 return "_".join(path_components) + ".pt"
@@ -664,7 +670,12 @@ class AttackTSInverseWorker(Worker):
                             dummy_out,
                             dummy_targets,
                         )
-                dummy_dy_dx = torch.autograd.grad(dummy_y, model.parameters(), create_graph=True)
+                dummy_dy_dx = torch.autograd.grad(
+                    dummy_y,
+                    [p for p in model.parameters()
+                     if config["dataset"] not in ETT_DATASETS or p.requires_grad],
+                    create_graph=True,
+                )
 
                 if attack_step >= config["num_attack_steps"]:
                     grad_dict, fig = self.plot_gradients(dummy_dy_dx, original_dy_dx, config)
@@ -2613,6 +2624,9 @@ class AttackTSInverseWorker(Worker):
                 # skip parameters or replace missing gradients with zeros.
                 gradients = []
                 for name, parameter in model.named_parameters():
+                    # Fixed timestamp embeddings are model state, not gradient entries.
+                    if not parameter.requires_grad:
+                        continue
                     if parameter.grad is None:
                         raise RuntimeError(
                             f"No gradient recorded for parameter {name!r}: "
@@ -2656,7 +2670,7 @@ class AttackTSInverseWorker(Worker):
 
                 if config["update_model"]:
                     for parameter, gradient in zip(
-                        model.parameters(), gradients
+                        (p for p in model.parameters() if p.requires_grad), gradients
                     ):
                         parameter.grad = gradient.detach().clone()
                     optimizer.step()
@@ -3442,6 +3456,10 @@ def create_gradient_inversion_dataloader(
 ):
     model.to(config["device"])
     model.eval()
+    gradient_parameters = [
+        p for p in model.parameters()
+        if config["dataset"] not in ETT_DATASETS or p.requires_grad
+    ]
 
     folder_path = "../data/_model_dataset_gradients/"
     task_kind = (
@@ -3607,6 +3625,8 @@ def create_gradient_inversion_dataloader(
             if config["verbose"]:
                 if config["dataset"] in ETT_DATASETS:
                     for name, parameter in model.named_parameters():
+                        if not parameter.requires_grad:
+                            continue
                         if parameter.grad is None:
                             raise RuntimeError(
                                 f"No auxiliary gradient for parameter {name!r}: "
@@ -3624,7 +3644,7 @@ def create_gradient_inversion_dataloader(
                 "none",
             }:
                 # Apply gradient defenses
-                gradients = [param.grad for param in model.parameters()]
+                gradients = [param.grad for param in gradient_parameters]
                 if config.get("sign", False):
                     gradients = apply_sign_transformation(gradients)
                 if config.get("prune_rate") is not None:
@@ -3633,10 +3653,10 @@ def create_gradient_inversion_dataloader(
                     gradients = add_gaussian_noise(gradients, config["dp_epsilon"])
 
                 # Update model parameters with modified gradients
-                for param, grad in zip(model.parameters(), gradients):
+                for param, grad in zip(gradient_parameters, gradients):
                     param.grad = grad
 
-            flattened_aux_dy_dx = torch.cat([p.grad.detach().view(-1) for p in model.parameters()]).unsqueeze(
+            flattened_aux_dy_dx = torch.cat([p.grad.detach().view(-1) for p in gradient_parameters]).unsqueeze(
                 0
             )  # add batch dimension but is always 1
 
