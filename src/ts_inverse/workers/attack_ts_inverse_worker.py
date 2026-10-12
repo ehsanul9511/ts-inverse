@@ -1,5 +1,6 @@
 import os
 from copy import deepcopy
+from tqdm import tqdm
 import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.data import DataLoader, ConcatDataset, TensorDataset
 
@@ -43,12 +44,16 @@ CLASSIFICATION_DATASETS = {
     "motionsense",
 }
 
+ETT_DATASETS = ["ETTh1", "ETTh2", "ETTm1", "ETTm2"]
+
 FEATURE_NAMES = [
     "acc_x", "acc_y", "acc_z",
     "gyro_x", "gyro_y", "gyro_z",
     "gravity_x", "gravity_y", "gravity_z",
     "rot_rate_x", "rot_rate_y", "rot_rate_z",
 ]
+
+ETT_FEATURE_NAMES = ["HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", "OT"]
 
 FEATURE_GROUPS = {
     "acc": [0, 1, 2],
@@ -83,7 +88,7 @@ class AttackTSInverseWorker(Worker):
             )
             print("Loaded MotionSense activity dataset")
         
-        elif dataset_name in {"ETTh1", "ETTh2", "ETTm1", "ETTm2"}:
+        elif dataset_name in ETT_DATASETS:
             self.train_datasets, self.val_datasets, self.test_datasets = (
                 get_ett_dataset(
                     dataset=dataset_name,
@@ -139,11 +144,19 @@ class AttackTSInverseWorker(Worker):
             worker_init_fn=seed_worker,
             generator=self.g,
         )
-        self.inputs_mean, self.inputs_std, self.targets_mean, self.targets_std = get_mean_std_dataloader(
-            mean_std_dataloader, c["device"]
+
+        (
+            self.inputs_mean,
+            self.inputs_std,
+            self.targets_mean,
+            self.targets_std,
+        ) = get_mean_std_dataloader(
+            mean_std_dataloader,
+            c["device"],
+            target_length=self.train_datasets[0].pred_len if dataset_name in ETT_DATASETS else None
         )
 
-        if dataset_name in {"realworld", "ETTh1", "ETTh2", "ETTm1", "ETTm2"}:
+        if dataset_name in {"realworld", *ETT_DATASETS}:
             model = final_model_settings["_model"]()
 
         elif dataset_name == "motionsense":
@@ -207,6 +220,22 @@ class AttackTSInverseWorker(Worker):
             self.train_model_and_record(model, tr_dataloader, config)
         )
 
+        if config["verbose"]:
+            print(
+                f"Recorded {len(self.all_batch_inputs)} gradient batches for attack."
+            )
+            print(
+                f"Batch input shape: {self.all_batch_inputs[0].shape}, "
+                f"Batch target shape: {self.all_batch_targets[0].shape}"
+            )
+            print(
+                f"Model state dict keys: {list(self.all_model_state_dicts[0].keys())}"
+            )
+            print(
+                f"Model gradient shapes: {[g.shape for g in self.all_model_gradients[0]]}"
+            )
+
+
         number_of_attacks = config["attack_number_of_batches"]
 
         if number_of_attacks > len(self.all_batch_inputs):
@@ -233,9 +262,23 @@ class AttackTSInverseWorker(Worker):
             self.all_dummy_targets.append(dummy_targets[0])
 
         dataset_name = config["dataset"]
-        if dataset_name not in CLASSIFICATION_DATASETS:
-            self.inputs_mean, self.inputs_std = self.inputs_mean[model.features], self.inputs_std[model.features]
-            self.targets_mean, self.targets_std = self.targets_mean[0], self.targets_std[0]
+
+        if dataset_name in ETT_DATASETS:
+            # ETT uses all input channels.
+            # For M/S, retain all target statistics already calculated.
+            if config.get("features", "M") == "MS":
+                self.targets_mean = self.targets_mean[-1:]
+                self.targets_std = self.targets_std[-1:]
+
+        elif dataset_name not in CLASSIFICATION_DATASETS:
+            self.inputs_mean, self.inputs_std = (
+                self.inputs_mean[model.features],
+                self.inputs_std[model.features],
+            )
+            self.targets_mean, self.targets_std = (
+                self.targets_mean[0],
+                self.targets_std[0],
+            )
         config["model_size"] = sum(p.numel() for p in model.parameters())
 
         if "aux_dataset" in config and config["aux_dataset"] is not None:
@@ -257,11 +300,22 @@ class AttackTSInverseWorker(Worker):
 
         # Prior knowledge datasets
         if dataset_name in CLASSIFICATION_DATASETS:
+            # Build one auxiliary gradient per sample.  inversion_model_epoch
+            # later groups these records to reproduce the attacked batch size
+            # before averaging their gradients.
             self.auxiliary_train_dataloader = DataLoader(
-                aux_trainset, batch_size=128, shuffle=False
+                aux_trainset,
+                batch_size=1,
+                shuffle=False,
+                worker_init_fn=seed_worker,
+                generator=self.g,
             )
             self.auxiliary_val_dataloader = DataLoader(
-                aux_valset, batch_size=128, shuffle=False
+                aux_valset,
+                batch_size=1,
+                shuffle=False,
+                worker_init_fn=seed_worker,
+                generator=self.g,
             )
         else:
             self.auxiliary_train_dataloader = DataLoader(
@@ -279,7 +333,7 @@ class AttackTSInverseWorker(Worker):
 
         self._update_config(config)
 
-        if config["verbose"]:
+        if config["verbose"] and config["aux_dataset"] is not None:
             print("Loaded auxiliary dataset with", len(self.aux_gi_t_dataset), "samples")
             print("Sample size:", self.aux_gi_t_dataset[0][0].shape, self.aux_gi_t_dataset[0][1].shape)
             print("Model / gradient size:", config["model_size"])
@@ -343,7 +397,7 @@ class AttackTSInverseWorker(Worker):
                 config["num_learn_epochs"],
             )
 
-            def generate_model_path(config, folder_path, batch_number, model, aux_gi_t_dataloader):
+            def generate_model_path(config, folder_path):
                 keys = [
                     "inversion_model",
                     "defense_name",
@@ -364,30 +418,28 @@ class AttackTSInverseWorker(Worker):
                     "inversion_batch_size",
                     "quantiles",
                 ]
+                dataset_name = config["dataset"]
 
                 path_components = [
                     folder_path,
                     "grad_inputs_targets_model",
-                    str(batch_number),
-                    *(
-                        str("-".join(map(str, config[key])) if isinstance(config[key], list) else config[key])
-                        for key in keys
-                        if key in config and config[key]
-                    ),
-                    model.name,
-                    "-".join(map(str, model.features)),
-                    str(len(aux_gi_t_dataloader.dataset)),
+                    # str(batch_number),
+                    dataset_name,
                 ]
 
                 return "_".join(path_components) + ".pt"
 
             folder_path = "../data/_model_dataset_gradients/"
-            model_path = generate_model_path(config, folder_path, batch_number, model, aux_gi_t_dataloader)
+            # TODO: Make the checkpoint path specific to the experiment configuration
+            # and victim model weights. For now, assume one fixed setup per dataset.
+            model_path = generate_model_path(config, folder_path)
             if os.path.exists(model_path) and config["load_lti_model"]:
+                print(f"Loading inversion model from file: {model_path}")
                 inversion_model.load_state_dict(torch.load(model_path))
-                print("Loaded inversion model to file.")
+                print(f"Loaded inversion model to file: {model_path}")
             else:
-                for epoch in range(0, config["num_learn_epochs"] + 1):
+
+                for epoch in tqdm(range(config["num_learn_epochs"])):
                     epoch_t_loss = self.inversion_model_epoch(
                         config, epoch, aux_gi_t_dataloader, inversion_model, grad_to_input_optimizer, lr_schedular
                     )
@@ -397,26 +449,30 @@ class AttackTSInverseWorker(Worker):
 
                     self.schedular_step(config["learn_lr_decay"], lr_schedular, attack_metrics, np.mean(epoch_v_loss))
 
-                    self.evaluate_dummy_prediction(
-                        config,
-                        batch_number,
-                        original_dy_dx,
-                        batch_inputs,
-                        batch_targets,
-                        dummy_inputs,
-                        dummy_targets,
-                        inversion_model,
-                        epoch,
-                        attack_metrics,
-                    )
+                    # self.evaluate_dummy_prediction(
+                    #     config,
+                    #     batch_number,
+                    #     original_dy_dx,
+                    #     batch_inputs,
+                    #     batch_targets,
+                    #     dummy_inputs,
+                    #     dummy_targets,
+                    #     inversion_model,
+                    #     epoch,
+                    #     attack_metrics,
+                    # )
                 torch.save(inversion_model.state_dict(), model_path)
-                print("Saved inversion model to file.")
+                print(f"Saved inversion model to file: {model_path}")
 
 
         if config["num_attack_steps"] == 0:
             return
 
-        if config["batch_size"] == 1 and config["one_shot_targets"]:
+        if (
+            config["dataset"] not in CLASSIFICATION_DATASETS
+            and config["batch_size"] == 1
+            and config["one_shot_targets"]
+        ):
             with torch.no_grad():
                 grad_w = original_dy_dx[-2]
                 grad_b = original_dy_dx[-1].unsqueeze(-1)
@@ -433,14 +489,31 @@ class AttackTSInverseWorker(Worker):
                     flattened_original_dy_dx.unsqueeze(0)
                 )
                 regularization_inputs = dummy_quantile_inputs.squeeze(0)  # remove batch dimension
-                regularization_targets = predicted_dummy_quantile_targets.squeeze(0)  # remove batch dimension
+                regularization_targets = None
                 # Repeat regularization inputs and targets to match the batch size
                 regularization_inputs = regularization_inputs.repeat(
                     batch_inputs.shape[0] // config["inversion_batch_size"], 1, 1, 1
                 )
-                regularization_targets = regularization_targets.repeat(
-                    batch_targets.shape[0] // config["inversion_batch_size"], 1, 1
-                )
+                if predicted_dummy_quantile_targets is not None:
+                    if config["dataset"] in ETT_DATASETS:
+                        regularization_targets = (
+                            predicted_dummy_quantile_targets.squeeze(0).repeat(
+                                batch_targets.shape[0]
+                                // config["inversion_batch_size"],
+                                1,
+                                1,
+                                1,
+                            )
+                        )
+                    else:
+                        regularization_targets = (
+                            predicted_dummy_quantile_targets.squeeze(0).repeat(
+                                batch_targets.shape[0]
+                                // config["inversion_batch_size"],
+                                1,
+                                1,
+                            )
+                        )
 
                 # The regularized inputs, targets last dimension are the quantiles and these should be swaped with the batch dimension
                 # dummy_inputs = regularization_inputs.permute(3, 1, 2, 0).squeeze(-1).detach().requires_grad_(True)
@@ -452,14 +525,20 @@ class AttackTSInverseWorker(Worker):
             else:
                 regularization_inputs, regularization_targets = inversion_model(flattened_original_dy_dx.unsqueeze(0))
                 regularization_inputs = regularization_inputs.view(batch_inputs.size()).detach()
-                regularization_targets = regularization_targets.view(batch_targets.size()).detach()
                 dummy_inputs = regularization_inputs.detach().clone().requires_grad_(True)
-                dummy_targets = regularization_targets.detach().clone().requires_grad_(True)
+                if regularization_targets is not None:
+                    regularization_targets = (
+                        regularization_targets.view(batch_targets.size()).detach()
+                    )
+                    dummy_targets = (
+                        regularization_targets.clone().requires_grad_(True)
+                    )
 
         optimization_space = [dummy_inputs]
 
         if config["attack_targets"] and (
-            config["batch_size"] > 1
+            config["dataset"] in ETT_DATASETS
+            or config["batch_size"] > 1
             or not config["one_shot_targets"]
         ):
             optimization_space.append(dummy_targets)
@@ -473,7 +552,7 @@ class AttackTSInverseWorker(Worker):
         )
 
         sample_mapping = np.arange(0, batch_inputs.shape[0])
-        if config["dataset"] not in CLASSIFICATION_DATASETS:
+        if config["dataset"] not in CLASSIFICATION_DATASETS and config["dataset"] not in ETT_DATASETS:
             plot_original_and_dummy_data(config, sample_mapping, dummy_inputs, dummy_targets, batch_inputs, batch_targets)
 
         for attack_step in range(0, config["num_attack_steps"] + 1):
@@ -485,22 +564,79 @@ class AttackTSInverseWorker(Worker):
             def closure():
                 dummy_optimizer.zero_grad()
                 model.zero_grad()
-                dy_dx_loss = torch.zeros(1, device=dummy_inputs.device)
+                zero_loss = dummy_inputs.new_zeros(())
+                loss_components = {
+                    "gradient_matching": zero_loss,
+                    "dropout_regularization": zero_loss,
+                    "inversion_regularization": zero_loss,
+                    "total_variation_inputs": zero_loss,
+                    "total_variation_targets": zero_loss,
+                    "lower_resolution_inputs": zero_loss,
+                    "lower_resolution_targets": zero_loss,
+                    "trend_regularization": zero_loss,
+                    "periodicity_regularization": zero_loss,
+                }
 
-                dummy_out = model(dummy_inputs)
-                # print(f"len(dummy_out): {len(dummy_out)}")
-                # print(f"dummy_out item shapes: {[dummy_out_i.shape for dummy_out_i in dummy_out]}")
-                # print(f"dummy_targets shape: {dummy_targets.shape}")
-                if config["dataset"] in CLASSIFICATION_DATASETS:
-                    dummy_y = nn.CrossEntropyLoss()(
-                        dummy_out,
-                        dummy_targets,
+                if config["dataset"] in ETT_DATASETS:
+                    pred_len = self.train_datasets[0].pred_len
+                    label_len = self.train_datasets[0].label_len
+                    feature_mode = self.train_datasets[0].features
+                    f_dim = -1 if feature_mode == "MS" else 0
+
+                    if not 0 <= label_len <= dummy_inputs.shape[1]:
+                        raise ValueError(
+                            "ETT label_len must be between 0 and "
+                            "the input sequence length."
+                        )
+
+                    # Decoder history overlaps the end of the input window.
+                    # Build it from the candidate input, preserving gradients.
+                    decoder_history = dummy_inputs[
+                        :, dummy_inputs.shape[1] - label_len:, :
+                    ]
+                    decoder_future = dummy_inputs.new_zeros(
+                        dummy_inputs.shape[0],
+                        pred_len,
+                        dummy_inputs.shape[2],
                     )
+                    dec_inp = torch.cat(
+                        [decoder_history, decoder_future],
+                        dim=1,
+                    )
+
+                    dummy_out = model(
+                        dummy_inputs,
+                        self.all_batch_input_marks[batch_number],
+                        dec_inp,
+                        self.all_batch_target_marks[batch_number],
+                    )
+                    if isinstance(dummy_out, tuple):
+                        dummy_out = dummy_out[0]
+
+                    dummy_out = dummy_out[:, -pred_len:, f_dim:]
+
+                    if dummy_out.shape != dummy_targets.shape:
+                        raise ValueError(
+                            f"ETT output shape {tuple(dummy_out.shape)} "
+                            "does not match dummy target shape "
+                            f"{tuple(dummy_targets.shape)}."
+                        )
+
+                    dummy_y = F.mse_loss(dummy_out, dummy_targets)
+
                 else:
-                    dummy_y = F.mse_loss(
-                        dummy_out,
-                        dummy_targets,
-                    )
+                    dummy_out = model(dummy_inputs)
+
+                    if config["dataset"] in CLASSIFICATION_DATASETS:
+                        dummy_y = nn.CrossEntropyLoss()(
+                            dummy_out,
+                            dummy_targets,
+                        )
+                    else:
+                        dummy_y = F.mse_loss(
+                            dummy_out,
+                            dummy_targets,
+                        )
                 dummy_dy_dx = torch.autograd.grad(dummy_y, model.parameters(), create_graph=True)
 
                 if attack_step >= config["num_attack_steps"]:
@@ -510,7 +646,11 @@ class AttackTSInverseWorker(Worker):
                         fig, attack_step + config["num_learn_epochs"], log_name="gradients", matplotlib_only=True
                     )
 
-                dy_dx_loss += self.gradient_loss_function(dummy_dy_dx, original_dy_dx, config["gradient_loss"])
+                loss_components["gradient_matching"] = self.gradient_loss_function(
+                    dummy_dy_dx,
+                    original_dy_dx,
+                    config["gradient_loss"],
+                )
 
                 if (
                     "TCN" in model.name
@@ -518,28 +658,39 @@ class AttackTSInverseWorker(Worker):
                     and config["dropout"] > 0
                     and config["dropout_probability_regularizer"] > 0
                 ):
+                    dropout_regularization = zero_loss
                     for dropout_layer in model.get_dropout_layers():
-                        dy_dx_loss += (
+                        dropout_regularization = dropout_regularization + (
                             config["dropout_probability_regularizer"]
                             * ((1 - dropout_layer.do_mask.mean()) - dropout_layer.p).abs()
                         )
+                    loss_components["dropout_regularization"] = dropout_regularization
 
                 if inversion_model is not None and (
                     config["inversion_regularization_term_inputs"] > 0 or config["inversion_regularization_term_targets"] > 0
                 ):
-                    dy_dx_loss += self.learned_prior_regularization(
+                    loss_components["inversion_regularization"] = self.learned_prior_regularization(
                         dummy_inputs, dummy_targets, regularization_inputs, regularization_targets, config
                     )
 
                 if "total_variation_alpha_inputs" in config and config["total_variation_alpha_inputs"] > 0:
-                    dy_dx_loss += config["total_variation_alpha_inputs"] * total_variation_time_series(dummy_inputs)
+                    loss_components["total_variation_inputs"] = (
+                        config["total_variation_alpha_inputs"]
+                        * total_variation_time_series(dummy_inputs)
+                    )
+                    
                 if (
                     config["dataset"] not in CLASSIFICATION_DATASETS
-                    and "total_variation_beta_targets" in config
-                    and config["total_variation_beta_targets"] > 0
+                    and config.get("total_variation_beta_targets", 0) > 0
                 ):
-                    dy_dx_loss += config["total_variation_beta_targets"] * total_variation_time_series(
-                        dummy_targets.unsqueeze(-1)
+                    if config["dataset"] in ETT_DATASETS:
+                        tv_targets = dummy_targets
+                    else:
+                        tv_targets = dummy_targets.unsqueeze(-1)
+
+                    loss_components["total_variation_targets"] = (
+                        config["total_variation_beta_targets"]
+                        * total_variation_time_series(tv_targets)
                     )
 
                 if config["dataset"] == "motionsense":
@@ -560,7 +711,7 @@ class AttackTSInverseWorker(Worker):
                                 dummy_inputs.shape[1],
                             )
 
-                        dy_dx_loss += (
+                        loss_components["lower_resolution_inputs"] = (
                             lower_res_weight
                             * F.l1_loss(filtered_inputs, dummy_inputs)
                         )
@@ -603,7 +754,7 @@ class AttackTSInverseWorker(Worker):
                                 / config["optimization_learning_rate"]
                             )
 
-                        dy_dx_loss += (
+                        loss_components["trend_regularization"] = (
                             trend_lr_term
                             * featurewise_trend_regularization(
                                 dummy_inputs,
@@ -627,7 +778,7 @@ class AttackTSInverseWorker(Worker):
                                 / config["optimization_learning_rate"]
                             )
 
-                        dy_dx_loss += (
+                        loss_components["periodicity_regularization"] = (
                             periodicity_lr_term
                             * config["periodicity_term"]
                             * featurewise_periodicity_regularization(
@@ -638,58 +789,150 @@ class AttackTSInverseWorker(Worker):
                         )
 
                 elif config["dataset"] not in CLASSIFICATION_DATASETS:
-                    # Keep the existing forecasting implementation here.
-                    combined_dummy_data_first_feature = torch.cat(
-                        [
-                            dummy_inputs[:, :, 0],
-                            dummy_targets[:, :],
-                        ],
-                        dim=1,
-                    )
+                    if config["dataset"] in ETT_DATASETS:
+                        if self.train_datasets[0].features == "MS":
+                            history = dummy_inputs[..., -1:]
+                        else:
+                            history = dummy_inputs
+
+                        combined_dummy_data = torch.cat(
+                            [history, dummy_targets], dim=1
+                        )
+                    else:
+                        combined_dummy_data_first_feature = torch.cat(
+                            [
+                                dummy_inputs[:, :, 0],
+                                dummy_targets[:, :],
+                            ],
+                            dim=1,
+                        )
 
                     if "lower_res_term_inputs" in config and config["lower_res_term_inputs"] > 0:
                         with torch.no_grad():
                             warped_inputs = temporal_resolution_warping(dummy_inputs, 2)
                             filtered_inputs = interpolate(warped_inputs, dummy_inputs.shape[1])
-                        dy_dx_loss += config["lower_res_term_inputs"] * F.l1_loss(filtered_inputs, dummy_inputs)
+                        loss_components["lower_resolution_inputs"] = (
+                            config["lower_res_term_inputs"]
+                            * F.l1_loss(filtered_inputs, dummy_inputs)
+                        )
 
-                    if "lower_res_term_targets" in config and config["lower_res_term_targets"] > 0:
+                    if config.get("lower_res_term_targets", 0) > 0:
                         with torch.no_grad():
-                            warped_targets = temporal_resolution_warping(dummy_targets.unsqueeze(-1), 2)
-                            filtered_targets = interpolate(warped_targets, dummy_targets.shape[1]).squeeze(-1)
-                        dy_dx_loss += config["lower_res_term_targets"] * F.l1_loss(filtered_targets, dummy_targets)
+                            if config["dataset"] in ETT_DATASETS:
+                                targets_for_filtering = dummy_targets
+                            else:
+                                targets_for_filtering = dummy_targets.unsqueeze(-1)
 
-                    if "trend_term" in config and config["trend_term"] > 0:
+                            warped_targets = temporal_resolution_warping(
+                                targets_for_filtering, 2
+                            )
+                            filtered_targets = interpolate(
+                                warped_targets, dummy_targets.shape[1]
+                            )
+
+                            if config["dataset"] not in ETT_DATASETS:
+                                filtered_targets = filtered_targets.squeeze(-1)
+
+                        loss_components["lower_resolution_targets"] = (
+                            config["lower_res_term_targets"]
+                            * F.l1_loss(filtered_targets, dummy_targets)
+                        )
+
+                    trend_term = config.get("trend_term", 0)
+                    is_group_weighted = isinstance(trend_term, dict)
+
+                    trend_enabled = (
+                        any(weight > 0 for weight in trend_term.values())
+                        if is_group_weighted
+                        else trend_term > 0
+                    )
+
+                    if trend_enabled:
                         lr_term = (
-                            dummy_schedular.get_last_lr()[0] / config["optimization_learning_rate"]
+                            dummy_schedular.get_last_lr()[0]
+                            / config["optimization_learning_rate"]
+                            if (
+                                attack_step > 0
+                                and config.get("trend_reduce_lr", False)
+                                and dummy_schedular is not None
+                            )
+                            else 1
+                        )
+
+                        if config["dataset"] in ETT_DATASETS or config["dataset"] in CLASSIFICATION_DATASETS:
+                            trend_loss = featurewise_trend_regularization(
+                                combined_dummy_data,
+                                config["trend_loss"],
+                                group_weights=(
+                                    trend_term if is_group_weighted else None
+                                ),
+                            )
+                            if not is_group_weighted:
+                                trend_loss = trend_term * trend_loss
+                        else:
+                            if is_group_weighted:
+                                raise ValueError(
+                                    "This forecasting branch uses a single "
+                                    "feature and requires a scalar trend_term."
+                                )
+
+                            trend_loss = (
+                                trend_term
+                                * trend_consistency_regularization(
+                                    combined_dummy_data_first_feature,
+                                    config["trend_loss"],
+                                )
+                            )
+
+                        loss_components["trend_regularization"] = (
+                            lr_term * trend_loss
+                        )
+
+                    if config.get("periodicity_term", 0) > 0:
+                        lr_term = (
+                            dummy_schedular.get_last_lr()[0]
+                            / config["optimization_learning_rate"]
                             if attack_step > 0 and config["trend_reduce_lr"]
                             else 1
                         )
-                        dy_dx_loss += (
-                            lr_term
-                            * config["trend_term"]
-                            * trend_consistency_regularization(combined_dummy_data_first_feature, config["trend_loss"])
-                        )
 
-                    if "periodicity_term" in config and config["periodicity_term"] > 0:
-                        lr_term = (
-                            dummy_schedular.get_last_lr()[0] / config["optimization_learning_rate"]
-                            if attack_step > 0 and config["trend_reduce_lr"]
-                            else 1
-                        )
-                        dy_dx_loss += (
+                        if config["dataset"] in ETT_DATASETS:
+                            periodicity_loss = featurewise_periodicity_regularization(
+                                combined_dummy_data,
+                                period=int(config["periodicity_period"]),
+                                loss=config["periodicity_loss"],
+                            )
+                        else:
+                            periodicity_loss = periodicity_regularization(
+                                combined_dummy_data_first_feature,
+                                period=dummy_targets.shape[1],
+                                loss=config["periodicity_loss"],
+                            )
+
+                        loss_components["periodicity_regularization"] = (
                             lr_term
                             * config["periodicity_term"]
-                            * periodicity_regularization(
-                                combined_dummy_data_first_feature, period=dummy_targets.shape[1], loss=config["periodicity_loss"]
-                            )
+                            * periodicity_loss
                         )
 
-                dy_dx_loss.backward()
+                total_loss = sum(loss_components.values(), zero_loss)
+                loss_components["total"] = total_loss
+                total_loss.backward()
 
                 if config["grad_signs_for_inputs"]:
                     dummy_inputs.grad.sign_()
-                if config["grad_signs_for_targets"]:
+                if config["dataset"] in ETT_DATASETS:
+                    if (
+                        config["attack_targets"]
+                        and config["grad_signs_for_targets"]
+                    ):
+                        if dummy_targets.grad is None:
+                            raise RuntimeError(
+                                "ETT target optimization is enabled, "
+                                "but dummy_targets has no gradient."
+                            )
+                        dummy_targets.grad.sign_()
+                elif config["grad_signs_for_targets"]:
                     dummy_targets.grad.sign_()
                 if (
                     "TCN" in model.name
@@ -700,9 +943,41 @@ class AttackTSInverseWorker(Worker):
                     for dropout_layer in model.get_dropout_layers():
                         dropout_layer.do_mask.grad.sign_()
 
-                return dy_dx_loss
+                return {
+                    name: value.detach()
+                    for name, value in loss_components.items()
+                }
 
-            dy_dx_loss = dummy_optimizer.step(closure)
+            if isinstance(dummy_optimizer, torch.optim.LBFGS):
+                latest_loss_components = None
+
+                def lbfgs_closure():
+                    nonlocal latest_loss_components
+                    latest_loss_components = closure()
+                    return latest_loss_components["total"]
+
+                dummy_optimizer.step(lbfgs_closure)
+                loss_components = latest_loss_components
+            else:
+                loss_components = dummy_optimizer.step(closure)
+
+            if not isinstance(loss_components, dict):
+                raise RuntimeError(
+                    "The attack closure did not return its loss components."
+                )
+
+            dy_dx_loss = loss_components["total"]
+            attack_metrics.update(
+                {
+                    f"loss/{name}": value.item()
+                    for name, value in loss_components.items()
+                }
+            )
+            # Preserve the existing dashboard key while making it represent
+            # only the gradient-matching term rather than the total loss.
+            attack_metrics["grad_diff_loss_mse"] = (
+                loss_components["gradient_matching"].item()
+            )
 
             self.after_effect(config, model, dummy_inputs, dummy_targets, attack_step)
 
@@ -710,7 +985,6 @@ class AttackTSInverseWorker(Worker):
 
             # Should calcualte evalaution metrics and log them
             if attack_step % (config["num_attack_steps"] // min(config["num_attack_steps"], 200)) == 0:
-                attack_metrics["grad_diff_loss_mse"] = dy_dx_loss
                 self.evaluate_and_log_reconstruction(
                     config,
                     batch_inputs,
@@ -782,32 +1056,696 @@ class AttackTSInverseWorker(Worker):
                 output_path,
             )
 
-            # Saving original batch inputs and targets for reference
-            original_data = (
-                batch_inputs.detach().cpu()
+    def _load_timegan_attack_prior(
+        self,
+        config,
+        batch_inputs,
+        batch_targets,
+    ):
+        dataset_name = config["dataset"]
+        if dataset_name not in {"motionsense", "mobifall"}:
+            raise ValueError(
+                "The TimeGAN GIFD experiment supports MotionSense and "
+                "MobiFall classification experiments."
             )
 
-            original_data_path = os.path.join(
-                output_directory,
-                (
-                    f"motionsense_original_"
-                    f"run_{config['run_number']}_"
-                    f"batch_{batch_number}.pt"
+        unique_labels = torch.unique(batch_targets.detach()).cpu()
+        if unique_labels.numel() != 1:
+            raise ValueError(
+                "A TimeGAN GIFD attack batch must contain one activity. "
+                "Use batch_size=1, or construct activity-homogeneous batches."
+            )
+
+        activity_label = int(unique_labels.item())
+        if activity_label not in ACTIVITY_LABEL_TO_TIMEGAN_ACTIVITY:
+            raise ValueError(
+                f"Unsupported {dataset_name} activity label: "
+                f"{activity_label}"
+            )
+
+        activity = ACTIVITY_LABEL_TO_TIMEGAN_ACTIVITY[
+            activity_label
+        ]
+        checkpoint_path = (
+            Path(config["timegan_checkpoint_root"])
+            / activity
+            / "timegan_checkpoint.pt"
+        )
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"TimeGAN checkpoint not found: {checkpoint_path}"
+            )
+
+        try:
+            checkpoint = torch.load(
+                checkpoint_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+        except TypeError:
+            checkpoint = torch.load(
+                checkpoint_path,
+                map_location="cpu",
+            )
+
+        prior = _TimeGANAttackPrior(
+            checkpoint["timegan_config"]
+        )
+        states = checkpoint["state_dict"]
+        prior.generator.load_state_dict(
+            states["generator"],
+            strict=True,
+        )
+        prior.supervisor.load_state_dict(
+            states["supervisor"],
+            strict=True,
+        )
+        prior.recovery.load_state_dict(
+            states["recovery"],
+            strict=True,
+        )
+        prior = prior.to(batch_inputs.device).train()
+
+        for parameter in prior.parameters():
+            parameter.requires_grad_(False)
+
+        if prior.sequence_length != batch_inputs.shape[1]:
+            raise ValueError(
+                "TimeGAN sequence length does not match the victim input: "
+                f"{prior.sequence_length} != {batch_inputs.shape[1]}"
+            )
+        if dataset_name == "motionsense" and (
+            prior.data_dim != batch_inputs.shape[2]
+        ):
+            raise ValueError(
+                "TimeGAN feature count does not match the victim input: "
+                f"{prior.data_dim} != {batch_inputs.shape[2]}"
+            )
+        if dataset_name == "mobifall":
+            if batch_inputs.shape[2] != 9:
+                raise ValueError(
+                    "The MobiFall victim must use the nine native sensor "
+                    f"features; received {batch_inputs.shape[2]}"
+                )
+            if prior.data_dim not in {9, 12}:
+                raise ValueError(
+                    "The MobiFall TimeGAN prior must produce either nine "
+                    "native features or the 12 engineered features from "
+                    f"train_mobifall_timegan.py; received {prior.data_dim}"
+                )
+
+        preprocessing = checkpoint["preprocessing"]
+        if dataset_name == "mobifall" and prior.data_dim == 12:
+            if (
+                preprocessing.get("external_standardization_mean")
+                is not None
+                or preprocessing.get("external_standardization_std")
+                is not None
+            ):
+                raise ValueError(
+                    "The 12-to-9 MobiFall adapter requires a TimeGAN "
+                    "checkpoint trained without external standardization."
+                )
+        timegan_minimum = torch.as_tensor(
+            preprocessing["timegan_minimum"],
+            dtype=batch_inputs.dtype,
+            device=batch_inputs.device,
+        ).view(1, 1, -1)
+        timegan_range = torch.as_tensor(
+            preprocessing["timegan_range"],
+            dtype=batch_inputs.dtype,
+            device=batch_inputs.device,
+        ).view(1, 1, -1)
+
+        dataset = self.train_datasets[0]
+        if not hasattr(dataset, "normalization_mean") or not hasattr(
+            dataset,
+            "normalization_std",
+        ):
+            raise AttributeError(
+                f"{dataset_name} dataset normalization metadata is "
+                "missing."
+            )
+
+        classifier_mean = torch.as_tensor(
+            dataset.normalization_mean,
+            dtype=batch_inputs.dtype,
+            device=batch_inputs.device,
+        ).view(1, 1, -1)
+        classifier_std = torch.as_tensor(
+            dataset.normalization_std,
+            dtype=batch_inputs.dtype,
+            device=batch_inputs.device,
+        ).view(1, 1, -1)
+        classifier_std = classifier_std.clamp_min(1e-8)
+
+        print(
+            f"Loaded {activity} TimeGAN prior for {dataset_name} label "
+            f"{activity_label}: {checkpoint_path}"
+        )
+
+        return (
+            prior,
+            timegan_minimum,
+            timegan_range,
+            classifier_mean,
+            classifier_std,
+        )
+
+    @staticmethod
+    def _decode_timegan_for_classifier(
+        normalized_output,
+        timegan_minimum,
+        timegan_range,
+        classifier_mean,
+        classifier_std,
+        dataset_name,
+    ):
+        raw_output = (
+            normalized_output * timegan_range + timegan_minimum
+        )
+        if dataset_name == "mobifall" and raw_output.shape[-1] == 12:
+            # train_mobifall_timegan.py generated MotionSense-compatible
+            # channels. Convert them back to MobiFall's nine native sensor
+            # channels for the victim classifier:
+            #   acceleration = (gravity + user acceleration) * g
+            #   orientation APR = attitude RPY reordered and rad -> degree.
+            acceleration = (
+                raw_output[..., 3:6] + raw_output[..., 9:12]
+            ) * MOBIFALL_GRAVITY_M_S2
+            gyroscope = raw_output[..., 6:9]
+            orientation_apr = torch.rad2deg(
+                raw_output[..., [2, 1, 0]]
+            )
+            raw_output = torch.cat(
+                [acceleration, gyroscope, orientation_apr],
+                dim=-1,
+            )
+        return (
+            raw_output - classifier_mean
+        ) / classifier_std
+
+    @staticmethod
+    def _project_feature_l1_ball_(
+        feature,
+        reference,
+        radius,
+    ):
+        """Project each sample onto an L1 ball around its initial feature."""
+        with torch.no_grad():
+            if radius < 0:
+                raise ValueError(
+                    "timegan_gifd_feature_l1_radius must be non-negative"
+                )
+            if radius == 0:
+                feature.copy_(reference)
+                return
+
+            delta = (feature - reference).reshape(
+                feature.shape[0],
+                -1,
+            )
+            l1_norm = delta.abs().sum(dim=1)
+            outside = l1_norm > radius
+            if outside.any():
+                selected = delta[outside]
+                absolute = selected.abs()
+                sorted_absolute, _ = torch.sort(
+                    absolute,
+                    dim=1,
+                    descending=True,
+                )
+                cumulative = torch.cumsum(
+                    sorted_absolute,
+                    dim=1,
+                )
+                indexes = torch.arange(
+                    1,
+                    selected.shape[1] + 1,
+                    device=feature.device,
+                    dtype=feature.dtype,
+                ).view(1, -1)
+                positive = (
+                    sorted_absolute
+                    - (cumulative - radius) / indexes
+                ) > 0
+                rho = positive.sum(dim=1).clamp_min(1) - 1
+                theta = (
+                    cumulative.gather(1, rho.unsqueeze(1)).squeeze(1)
+                    - radius
+                ) / (rho.to(feature.dtype) + 1)
+                projected = selected.sign() * torch.clamp(
+                    absolute - theta.unsqueeze(1),
+                    min=0,
+                )
+                delta[outside] = projected
+
+            projected_feature = (
+                reference + delta.reshape_as(feature)
+            ).clamp(0.0, 1.0)
+            feature.copy_(projected_feature)
+
+    def _timegan_gifd_gradient_loss(
+        self,
+        model,
+        reconstructed_inputs,
+        dummy_targets,
+        original_dy_dx,
+        config,
+    ):
+        dummy_out = model(reconstructed_inputs)
+        dummy_y = nn.CrossEntropyLoss()(
+            dummy_out,
+            dummy_targets,
+        )
+        dummy_dy_dx = torch.autograd.grad(
+            dummy_y,
+            model.parameters(),
+            create_graph=True,
+        )
+        loss = self.gradient_loss_function(
+            dummy_dy_dx,
+            original_dy_dx,
+            config["gradient_loss"],
+        )
+
+        if config.get("total_variation_alpha_inputs", 0) > 0:
+            loss += (
+                config["total_variation_alpha_inputs"]
+                * total_variation_time_series(reconstructed_inputs)
+            )
+
+        lower_res_weight = config.get(
+            "lower_res_term_inputs",
+            config.get("lower_res_term", 0),
+        )
+        if lower_res_weight > 0:
+            with torch.no_grad():
+                warped_inputs = temporal_resolution_warping(
+                    reconstructed_inputs,
+                    2,
+                )
+                filtered_inputs = interpolate(
+                    warped_inputs,
+                    reconstructed_inputs.shape[1],
+                )
+            loss += lower_res_weight * F.l1_loss(
+                filtered_inputs,
+                reconstructed_inputs,
+            )
+
+        # if config.get("trend_term", 0) > 0:
+        #     loss += (
+        #         config["trend_term"]
+        #         * featurewise_trend_regularization(
+        #             reconstructed_inputs,
+        #             config["trend_loss"],
+        #         )
+        #     )
+
+
+        trend_weights = config.get("trend_term", {})
+
+        if any(weight > 0 for weight in trend_weights.values()):
+            trend_lr_term = 1.0
+
+            loss += (
+                trend_lr_term
+                * featurewise_trend_regularization(
+                    reconstructed_inputs,
+                    config["trend_loss"],
+                    group_weights=trend_weights,
+                )
+            )
+
+        if config.get("periodicity_term", 0) > 0:
+            loss += (
+                config["periodicity_term"]
+                * featurewise_periodicity_regularization(
+                    reconstructed_inputs,
+                    period=int(config["periodicity_period"]),
+                    loss=config["periodicity_loss"],
+                )
+            )
+
+        return loss
+
+    def _log_timegan_gifd_reconstruction(
+        self,
+        config,
+        batch_inputs,
+        batch_targets,
+        reconstructed_inputs,
+        dummy_targets,
+        batch_number,
+        attack_step,
+        loss,
+        extra_metrics,
+    ):
+        metrics = {
+            "step": attack_step,
+            "grad_diff_loss_mse": loss.detach().item(),
+            **extra_metrics,
+        }
+        self.evaluate_and_log_reconstruction(
+            config,
+            batch_inputs,
+            batch_targets,
+            reconstructed_inputs,
+            dummy_targets,
+            batch_number,
+            attack_step,
+            config["num_attack_steps"],
+            metrics,
+            attack_step_offset=config.get(
+                "num_learn_epochs",
+                0,
+            ),
+        )
+
+    def attack_batch_with_timegan_gifd(
+        self,
+        model,
+        config,
+        batch_number,
+        original_dy_dx,
+        dummy_targets,
+        batch_inputs,
+        batch_targets,
+    ):
+        """Optimize TimeGAN noise, then its generated feature sequence.
+
+        The second stage is the recurrent TimeGAN analogue of GIFD feature
+        domain optimization. Its search is constrained to an L1 ball around
+        the feature sequence produced at the end of latent optimization.
+        """
+        if config.get("attack_targets", False):
+            raise ValueError(
+                "TimeGAN GIFD assumes known activity labels; "
+                "set attack_targets=False."
+            )
+
+        latent_steps = int(config["timegan_gifd_latent_steps"])
+        feature_steps = int(config["timegan_gifd_feature_steps"])
+        total_steps = latent_steps + feature_steps
+        if total_steps <= 0:
+            raise ValueError(
+                "At least one TimeGAN GIFD optimization step is required."
+            )
+        if total_steps != config["num_attack_steps"]:
+            raise ValueError(
+                "num_attack_steps must equal TimeGAN latent plus feature "
+                "steps."
+            )
+
+        (
+            prior,
+            timegan_minimum,
+            timegan_range,
+            classifier_mean,
+            classifier_std,
+        ) = self._load_timegan_attack_prior(
+            config,
+            batch_inputs,
+            batch_targets,
+        )
+
+        dummy_targets = (
+            batch_targets.detach().clone().to(batch_inputs.device)
+        )
+        latent = torch.rand(
+            batch_inputs.shape[0],
+            prior.sequence_length,
+            prior.z_dim,
+            dtype=batch_inputs.dtype,
+            device=batch_inputs.device,
+            requires_grad=True,
+        )
+        log_interval = max(
+            1,
+            total_steps // min(total_steps, 200),
+        )
+
+        def decode_normalized(normalized_output):
+            return self._decode_timegan_for_classifier(
+                normalized_output,
+                timegan_minimum,
+                timegan_range,
+                classifier_mean,
+                classifier_std,
+                config["dataset"],
+            )
+
+        latent_optimizer, latent_scheduler = (
+            self.set_attack_optimizer_and_schedular(
+                [latent],
+                config.get(
+                    "timegan_gifd_optimizer",
+                    "adam",
                 ),
+                config["timegan_gifd_latent_learning_rate"],
+                config.get(
+                    "timegan_gifd_lr_decay",
+                    "on_plateau_10",
+                ),
+                max(latent_steps, 1),
+            )
+        )
+        if latent_optimizer is None:
+            raise ValueError(
+                "Unsupported TimeGAN GIFD optimizer: "
+                f"{config.get('timegan_gifd_optimizer')}"
             )
 
-            torch.save(
-                {
-                    "original_data": original_data,
-                    "gender":corresponding_genders,
-                },
-                original_data_path,
+        print(
+            "TimeGAN GIFD stage 1/2: optimizing latent noise for "
+            f"{latent_steps} steps"
+        )
+        for stage_step in range(latent_steps):
+            attack_step = stage_step
+
+            def latent_closure():
+                latent_optimizer.zero_grad()
+                model.zero_grad()
+                reconstructed_inputs = decode_normalized(
+                    prior(latent)
+                )
+                loss = self._timegan_gifd_gradient_loss(
+                    model,
+                    reconstructed_inputs,
+                    dummy_targets,
+                    original_dy_dx,
+                    config,
+                )
+                loss.backward()
+                if config.get(
+                    "timegan_gifd_sign_gradients",
+                    False,
+                ):
+                    latent.grad.sign_()
+                return loss
+
+            loss = latent_optimizer.step(latent_closure)
+            with torch.no_grad():
+                latent.clamp_(0.0, 1.0)
+
+            scheduler_metrics = {}
+            self.schedular_step(
+                config.get(
+                    "timegan_gifd_lr_decay",
+                    "on_plateau_10",
+                ),
+                latent_scheduler,
+                scheduler_metrics,
+                loss,
             )
 
-            print(
-                "Saved original data and gender:",
-                original_data_path,
+            if (
+                attack_step % log_interval == 0
+                or stage_step == latent_steps - 1
+            ):
+                with torch.no_grad():
+                    reconstructed_inputs = decode_normalized(
+                        prior(latent)
+                    )
+                self._log_timegan_gifd_reconstruction(
+                    config,
+                    batch_inputs,
+                    batch_targets,
+                    reconstructed_inputs,
+                    dummy_targets,
+                    batch_number,
+                    attack_step,
+                    loss,
+                    {
+                        "timegan_gifd/stage": 0,
+                        "timegan_gifd/latent_l2": (
+                            latent.detach().square().sum().sqrt().item()
+                        ),
+                        **scheduler_metrics,
+                    },
+                )
+
+        with torch.no_grad():
+            feature_reference = prior.generated_features(
+                latent
+            ).detach()
+        optimized_feature = (
+            feature_reference.clone().requires_grad_(True)
+        )
+        feature_radius = float(
+            config["timegan_gifd_feature_l1_radius"]
+        )
+
+        feature_optimizer, feature_scheduler = (
+            self.set_attack_optimizer_and_schedular(
+                [optimized_feature],
+                config.get(
+                    "timegan_gifd_optimizer",
+                    "adam",
+                ),
+                config[
+                    "timegan_gifd_feature_learning_rate"
+                ],
+                config.get(
+                    "timegan_gifd_lr_decay",
+                    "on_plateau_10",
+                ),
+                max(feature_steps, 1),
             )
+        )
+        if feature_optimizer is None:
+            raise ValueError(
+                "Unsupported TimeGAN GIFD optimizer: "
+                f"{config.get('timegan_gifd_optimizer')}"
+            )
+
+        print(
+            "TimeGAN GIFD stage 2/2: optimizing generated features for "
+            f"{feature_steps} steps inside an L1 ball of radius "
+            f"{feature_radius}"
+        )
+        for stage_step in range(feature_steps):
+            attack_step = latent_steps + stage_step
+
+            def feature_closure():
+                feature_optimizer.zero_grad()
+                model.zero_grad()
+                reconstructed_inputs = decode_normalized(
+                    prior.decode_features(optimized_feature)
+                )
+                loss = self._timegan_gifd_gradient_loss(
+                    model,
+                    reconstructed_inputs,
+                    dummy_targets,
+                    original_dy_dx,
+                    config,
+                )
+                loss.backward()
+                if config.get(
+                    "timegan_gifd_sign_gradients",
+                    False,
+                ):
+                    optimized_feature.grad.sign_()
+                return loss
+
+            loss = feature_optimizer.step(feature_closure)
+            self._project_feature_l1_ball_(
+                optimized_feature,
+                feature_reference,
+                feature_radius,
+            )
+
+            scheduler_metrics = {}
+            self.schedular_step(
+                config.get(
+                    "timegan_gifd_lr_decay",
+                    "on_plateau_10",
+                ),
+                feature_scheduler,
+                scheduler_metrics,
+                loss,
+            )
+
+            if (
+                attack_step % log_interval == 0
+                or stage_step == feature_steps - 1
+            ):
+                with torch.no_grad():
+                    reconstructed_inputs = decode_normalized(
+                        prior.decode_features(optimized_feature)
+                    )
+                    feature_l1 = (
+                        optimized_feature - feature_reference
+                    ).abs().flatten(1).sum(dim=1).mean().item()
+                self._log_timegan_gifd_reconstruction(
+                    config,
+                    batch_inputs,
+                    batch_targets,
+                    reconstructed_inputs,
+                    dummy_targets,
+                    batch_number,
+                    attack_step,
+                    loss,
+                    {
+                        "timegan_gifd/stage": 1,
+                        "timegan_gifd/feature_l1": feature_l1,
+                        **scheduler_metrics,
+                    },
+                )
+
+        with torch.no_grad():
+            if feature_steps > 0:
+                reconstructed_inputs = decode_normalized(
+                    prior.decode_features(optimized_feature)
+                )
+            else:
+                reconstructed_inputs = decode_normalized(
+                    prior(latent)
+                )
+
+        self.all_dummy_inputs[batch_number] = (
+            reconstructed_inputs.detach().clone()
+        )
+        self.all_dummy_targets[batch_number] = (
+            dummy_targets.detach().clone()
+        )
+
+        final_mapping = get_batch_sample_mapping(
+            batch_inputs,
+            reconstructed_inputs,
+        )
+        reconstructed_data = (
+            reconstructed_inputs[final_mapping].detach().cpu()
+        )
+        corresponding_genders = (
+            self.all_batch_genders[batch_number].detach().cpu()
+        )
+        output_directory = config.get(
+            "reconstruction_output_dir",
+            "../data/_reconstructions",
+        )
+        os.makedirs(output_directory, exist_ok=True)
+        output_path = os.path.join(
+            output_directory,
+            (
+                f"{config['dataset']}_reconstruction_"
+                f"run_{config['run_number']}_"
+                f"batch_{batch_number}.pt"
+            ),
+        )
+        torch.save(
+            {
+                "reconstructed_data": reconstructed_data,
+                "gender": corresponding_genders,
+                "attack": "timegan_gifd",
+            },
+            output_path,
+        )
+        print(
+            "Saved TimeGAN GIFD reconstructed data and gender:",
+            output_path,
+        )
 
     def learned_prior_regularization(self, dummy_inputs, dummy_targets, regularization_inputs, regularization_targets, config):
         learned_prior_regularization = torch.zeros(1, device=dummy_inputs.device)
@@ -832,10 +1770,10 @@ class AttackTSInverseWorker(Worker):
                 def out_of_bound_loss(sequence, sequence_quantiles):
                     bound_loss = torch.zeros(1, device=sequence.device)
                     for tau_q in range(sequence_quantiles.shape[-1] // 2):
-                        quantile_upper_bound = sequence_quantiles[..., tau_q].reshape(sequence.shape)
-                        quantile_lower_bound = sequence_quantiles[..., -tau_q - 1].reshape(sequence.shape)
-                        bound_loss += F.relu(sequence - quantile_upper_bound).mean()
+                        quantile_lower_bound = sequence_quantiles[..., tau_q].reshape(sequence.shape)
+                        quantile_upper_bound = sequence_quantiles[..., -tau_q - 1].reshape(sequence.shape)
                         bound_loss += F.relu(quantile_lower_bound - sequence).mean()
+                        bound_loss += F.relu(sequence - quantile_upper_bound).mean()
                     return bound_loss / 2
 
                 if config["inversion_regularization_term_inputs"] > 0:
@@ -848,12 +1786,14 @@ class AttackTSInverseWorker(Worker):
                     )
 
         elif config["inversion_regularization_loss"] == "l1":
-            learned_prior_regularization += config["inversion_regularization_term_inputs"] * F.l1_loss(
-                dummy_inputs, regularization_inputs
-            )
-            learned_prior_regularization += config["inversion_regularization_term_targets"] * F.l1_loss(
-                dummy_targets, regularization_targets
-            )
+            if config["inversion_regularization_term_inputs"] > 0:
+                learned_prior_regularization += config["inversion_regularization_term_inputs"] * F.l1_loss(
+                    dummy_inputs, regularization_inputs
+                )
+            if config["inversion_regularization_term_targets"] > 0:
+                learned_prior_regularization += config["inversion_regularization_term_targets"] * F.l1_loss(
+                    dummy_targets, regularization_targets
+                )
         else:
             raise NotImplementedError(f"Inversion regularization loss not found: {config['inversion_regularization_loss']}")
         return learned_prior_regularization
@@ -880,13 +1820,21 @@ class AttackTSInverseWorker(Worker):
             ).to(config["device"])
         elif config["inversion_model"] == "ImprovedGradToInputNN_Probabilistic":
             inversion_model = ImprovedGradToInputNN_Probabilistic(
-                config["attack_hidden_size"], config["model_size"], input_shape, target_shape, distribution=config["attack_loss"]
+                config["attack_hidden_size"],
+                config["model_size"],
+                data_observations_shape,
+                data_targets_shape,
+                distribution=config["attack_loss"],
             ).to(config["device"])
         elif config["inversion_model"] == "ImprovedGradToInputNN_Quantile":
             inversion_model = ImprovedGradToInputNN_Quantile(
-                config["attack_hidden_size"], config["model_size"], input_shape, target_shape, quantiles=config["quantiles"]
+                config["attack_hidden_size"],
+                config["model_size"],
+                data_observations_shape,
+                data_targets_shape,
+                quantiles=config["quantiles"],
             ).to(config["device"])
-        return inversion_model, input_shape, target_shape
+        return inversion_model, data_observations_shape, data_targets_shape
 
     def calculate_inversion_model_loss(
         self, inversion_model, config, attack_batch_size, predicted_inputs, predicted_targets, aux_inputs, aux_targets
@@ -935,9 +1883,47 @@ class AttackTSInverseWorker(Worker):
             assert predicted_inputs is not None, "Predicted inputs should not be None for quantile loss"
 
             predicted_inputs = predicted_inputs.repeat(1, config["batch_size"] // config["inversion_batch_size"], 1, 1, 1)
-            predicted_targets = predicted_targets.unsqueeze(-2)  # behind quantiles
-            predicted_targets = predicted_targets.repeat(1, config["batch_size"] // config["inversion_batch_size"], 1, 1, 1)
-            aux_targets = aux_targets.unsqueeze(-1)  # last dimension
+
+            # Activity labels are assumed known for MotionSense and MobiFall.
+            # Their inversion model therefore predicts quantiles for the IMU
+            # input only, unlike forecasting TS-Inverse which also predicts a
+            # future target sequence.
+            if predicted_targets is None:
+                predicted_inputs = predicted_inputs.reshape(
+                    attack_batch_size * config["batch_size"],
+                    -1,
+                    len(config["quantiles"]),
+                )
+                aux_inputs = aux_inputs.reshape(
+                    attack_batch_size * config["batch_size"],
+                    -1,
+                )
+                return pinball_loss(
+                    predicted_inputs,
+                    aux_inputs,
+                    config["quantiles"],
+                )
+
+            if config["dataset"] in ETT_DATASETS:
+                # ETT targets already have a feature dimension.
+                predicted_targets = predicted_targets.repeat(
+                    1,
+                    config["batch_size"] // config["inversion_batch_size"],
+                    1,
+                    1,
+                    1,
+                )
+            else:
+                # Preserve the existing univariate forecasting behavior.
+                predicted_targets = predicted_targets.unsqueeze(-2)
+                predicted_targets = predicted_targets.repeat(
+                    1,
+                    config["batch_size"] // config["inversion_batch_size"],
+                    1,
+                    1,
+                    1,
+                )
+                aux_targets = aux_targets.unsqueeze(-1)
 
             # Calculate pairwise pinball losses between combined vectors
             # Dimensions of Predicted data = (attack_batch_size, config['batch_size'], sequence_length, n_features, n_quantiles)
@@ -1007,14 +1993,51 @@ class AttackTSInverseWorker(Worker):
                 )
                 dummy_inputs = dummy_quantile_inputs
 
-                if predicted_dummy_quantile_targets is not None:
-                    dummy_quantile_targets = predicted_dummy_quantile_targets.squeeze(0).repeat(
-                        batch_targets.shape[0] // config["inversion_batch_size"], 1, 1
-                    )
-                    dummy_targets = dummy_quantile_targets
-
                 def pinball_loss_simple(batch_inputs, dummy_inputs):
                     return pinball_loss(dummy_inputs, batch_inputs, config["quantiles"])
+
+                if config["dataset"] in {"motionsense", "mobifall"} or ( config["dataset"] in ETT_DATASETS and predicted_dummy_quantile_targets is None):
+                    input_sample_mapping = get_batch_sample_mapping(
+                        batch_inputs,
+                        dummy_inputs,
+                        function=pinball_loss_simple,
+                    )
+                    attack_metrics["inputs/pinball/mean"] = (
+                        pinball_loss_simple(
+                            batch_inputs,
+                            dummy_inputs[input_sample_mapping],
+                        ).item()
+                    )
+                    for i, j in enumerate(input_sample_mapping):
+                        attack_metrics[f"inputs/pinball/{i}"] = (
+                            pinball_loss_simple(
+                                batch_inputs[i],
+                                dummy_inputs[j],
+                            ).item()
+                        )
+                    self._log_metrics(attack_metrics, step=epoch)
+                    return
+
+                if predicted_dummy_quantile_targets is not None:
+                    if config["dataset"] in ETT_DATASETS:
+                        dummy_quantile_targets = (
+                            predicted_dummy_quantile_targets.squeeze(0).repeat(
+                                batch_targets.shape[0] // config["inversion_batch_size"],
+                                1,
+                                1,
+                                1,
+                            )
+                        )
+                    else:
+                        dummy_quantile_targets = (
+                            predicted_dummy_quantile_targets.squeeze(0).repeat(
+                                batch_targets.shape[0] // config["inversion_batch_size"],
+                                1,
+                                1,
+                            )
+                        )
+
+                    dummy_targets = dummy_quantile_targets
 
                 standard_mapping = np.arange(0, batch_inputs.shape[0])
                 input_sample_mapping = get_batch_sample_mapping(batch_inputs, dummy_inputs, function=pinball_loss_simple)
@@ -1040,7 +2063,12 @@ class AttackTSInverseWorker(Worker):
                     }
                     attack_metrics.update(individual_evaluation)
 
-                if epoch % (config["num_learn_epochs"] // 10) == 0:
+                if config["dataset"] in ETT_DATASETS:
+                    plot_interval = max(1, config["num_learn_epochs"] // 10)
+                else:
+                    plot_interval = config["num_learn_epochs"] // 10
+
+                if epoch % plot_interval == 0:
                     quantile_df, fig = plot_quantile_dummy_data(
                         config, sample_mapping, dummy_inputs, dummy_targets, batch_inputs, batch_targets
                     )
@@ -1056,9 +2084,20 @@ class AttackTSInverseWorker(Worker):
                 dummy_inputs = dummy_inputs.repeat(batch_inputs.size(0) // dummy_inputs.size(1), 1, 1, 1)
                 dummy_inputs = dummy_inputs.view(batch_inputs.size())
                 if predicted_dummy_targets is not None:
-                    predicted_dummy_targets = predicted_dummy_targets.repeat(
-                        batch_targets.size(0) // predicted_dummy_targets.size(1), 1, 1
-                    )
+                    if config["dataset"] in ETT_DATASETS:
+                        predicted_dummy_targets = predicted_dummy_targets.repeat(
+                            batch_targets.size(0) // predicted_dummy_targets.size(1),
+                            1,
+                            1,
+                            1,
+                        )
+                    else:
+                        predicted_dummy_targets = predicted_dummy_targets.repeat(
+                            batch_targets.size(0) // predicted_dummy_targets.size(1),
+                            1,
+                            1,
+                        )
+
                     dummy_targets = predicted_dummy_targets.view(batch_targets.size())
                 self.evaluate_and_log_reconstruction(
                     config,
@@ -1100,11 +2139,32 @@ class AttackTSInverseWorker(Worker):
                 1
             )  # gradients are always averaged over batch size
             aux_inputs = aux_inputs.view(batch_size, config["batch_size"], *aux_inputs.shape[-2:])
-            aux_targets = aux_targets.view(batch_size, config["batch_size"], *aux_targets.shape[-1:])  # Only 1 feature
 
-            if aux_inputs.min() < 0 or aux_inputs.max() > 1:
+            if config["dataset"] in ETT_DATASETS:
+                aux_targets = aux_targets.reshape(
+                    batch_size,
+                    config["batch_size"],
+                    *aux_targets.shape[-2:],
+                )
+            else:
+                aux_targets = aux_targets.view(
+                    batch_size,
+                    config["batch_size"],
+                    *aux_targets.shape[-1:],
+                )
+
+            if (
+                config["dataset"] not in CLASSIFICATION_DATASETS
+                and config["dataset"] not in ETT_DATASETS
+                and (aux_inputs.min() < 0 or aux_inputs.max() > 1)
+            ):
                 print("Aux inputs out of range:", aux_inputs.min(), aux_inputs.max())
-            if aux_targets.min() < 0 or aux_targets.max() > 1:
+
+            if (
+                config["dataset"] not in CLASSIFICATION_DATASETS
+                and config["dataset"] not in ETT_DATASETS
+                and (aux_targets.min() < 0 or aux_targets.max() > 1)
+            ):
                 print("Aux targets out of range:", aux_targets.min(), aux_targets.max())
 
             predicted_inputs, predicted_targets = inversion_model(aux_grads)
@@ -1375,6 +2435,205 @@ class AttackTSInverseWorker(Worker):
                     optimizer.step()
 
                 total_batches_processed += 1
+
+        elif dataset in ETT_DATASETS:
+            pred_len = self.train_datasets[0].pred_len
+            label_len = self.train_datasets[0].label_len
+            feature_mode = self.train_datasets[0].features
+            f_dim = -1 if feature_mode == "MS" else 0
+
+            model_train_epochs = config.get("model_train_epochs", 10)
+            number_of_batches = config["number_of_batches"]
+
+            if len(tr_dataloader) == 0:
+                raise ValueError("The ETT dataloader is empty.")
+
+            if number_of_batches > len(tr_dataloader):
+                raise ValueError(
+                    f"Requested {number_of_batches} gradient batches, "
+                    f"but the ETT dataloader contains "
+                    f"{len(tr_dataloader)} batches."
+                )
+
+            model_train_loader = DataLoader(
+                tr_dataloader.dataset,
+                batch_size=config.get("model_train_batch_size", 32),
+                shuffle=True,
+                worker_init_fn=seed_worker,
+                generator=self.g,
+            )
+
+            optimizer = torch.optim.Adam(
+                model.parameters(),
+                lr=config.get("model_train_learning_rate", 1e-4),
+            )
+
+            loss_function = nn.MSELoss()
+
+            # Train the forecasting model.
+            for epoch in range(model_train_epochs):
+                model.train()
+
+                epoch_squared_error = 0.0
+                epoch_target_elements = 0
+
+                for batch_x, batch_y, batch_x_mark, batch_y_mark in model_train_loader:
+                    batch_x = batch_x.float().to(config["device"])
+                    batch_y = batch_y.float().to(config["device"])
+                    batch_x_mark = batch_x_mark.float().to(config["device"])
+                    batch_y_mark = batch_y_mark.float().to(config["device"])
+
+                    dec_inp = torch.cat(
+                        [
+                            batch_y[:, :label_len, :],
+                            torch.zeros_like(batch_y[:, -pred_len:, :]),
+                        ],
+                        dim=1,
+                    )
+
+                    optimizer.zero_grad(set_to_none=True)
+
+                    outputs = model(
+                        batch_x,
+                        batch_x_mark,
+                        dec_inp,
+                        batch_y_mark,
+                    )
+                    if isinstance(outputs, tuple):
+                        outputs = outputs[0]
+
+                    outputs = outputs[:, -pred_len:, f_dim:]
+                    targets = batch_y[:, -pred_len:, f_dim:]
+
+                    if outputs.shape != targets.shape:
+                        raise ValueError(
+                            f"ETT output shape {tuple(outputs.shape)} "
+                            f"does not match target shape {tuple(targets.shape)}."
+                        )
+
+                    loss = loss_function(outputs, targets)
+                    loss.backward()
+                    optimizer.step()
+
+                    epoch_squared_error += loss.item() * targets.numel()
+                    epoch_target_elements += targets.numel()
+
+                print(
+                    f"ETT epoch {epoch + 1:02d}/{model_train_epochs} | "
+                    f"MSE {epoch_squared_error / epoch_target_elements:.6f}"
+                )
+
+            # Record deterministic gradients, with dropout disabled.
+            # Reconstruction must also use model.eval().
+            model.eval()
+
+            self.all_batch_input_marks = []
+            self.all_batch_target_marks = []
+
+            for batch_number, batch in enumerate(tr_dataloader):
+                if batch_number >= number_of_batches:
+                    break
+
+                batch_x, batch_y, batch_x_mark, batch_y_mark = batch
+                batch_x = batch_x.float().to(config["device"])
+                batch_y = batch_y.float().to(config["device"])
+                batch_x_mark = batch_x_mark.float().to(config["device"])
+                batch_y_mark = batch_y_mark.float().to(config["device"])
+
+                dec_inp = torch.cat(
+                    [
+                        batch_y[:, :label_len, :],
+                        torch.zeros_like(batch_y[:, -pred_len:, :]),
+                    ],
+                    dim=1,
+                )
+
+                state_before = {
+                    name: value.detach().clone()
+                    for name, value in model.state_dict().items()
+                }
+
+                model.zero_grad(set_to_none=True)
+
+                outputs = model(
+                    batch_x,
+                    batch_x_mark,
+                    dec_inp,
+                    batch_y_mark,
+                )
+                if isinstance(outputs, tuple):
+                    outputs = outputs[0]
+
+                outputs = outputs[:, -pred_len:, f_dim:]
+                targets = batch_y[:, -pred_len:, f_dim:]
+
+                if outputs.shape != targets.shape:
+                    raise ValueError(
+                        f"ETT output shape {tuple(outputs.shape)} "
+                        f"does not match target shape {tuple(targets.shape)}."
+                    )
+
+                loss = loss_function(outputs, targets)
+                loss.backward()
+
+                # Preserve model.parameters() ordering. Do not silently
+                # skip parameters or replace missing gradients with zeros.
+                gradients = []
+                for name, parameter in model.named_parameters():
+                    if parameter.grad is None:
+                        raise RuntimeError(
+                            f"No gradient recorded for parameter {name!r}: "
+                            f"shape={tuple(parameter.shape)}, "
+                            f"requires_grad={parameter.requires_grad}. "
+                            "Inspect why this parameter has no gradient "
+                            "before continuing the experiment."
+                        )
+                    if not torch.isfinite(parameter.grad).all():
+                        raise RuntimeError(
+                            f"Non-finite gradient recorded for parameter {name!r}."
+                        )
+                    gradients.append(parameter.grad.detach().clone())
+
+                # Apply configured defenses only after checking raw gradients.
+                if config.get("defense_name", "none") not in {None, "none"}:
+                    if config.get("sign", False):
+                        gradients = apply_sign_transformation(gradients)
+                    if config.get("prune_rate") is not None:
+                        gradients = apply_pruning(
+                            gradients, config["prune_rate"]
+                        )
+                    if config.get("dp_epsilon", 0) > 0:
+                        gradients = add_gaussian_noise(
+                            gradients, config["dp_epsilon"]
+                        )
+
+                all_batch_inputs.append(batch_x.detach().clone())
+                all_batch_targets.append(targets.detach().clone())
+                all_model_state_dicts.append(state_before)
+                all_model_gradients.append(
+                    [gradient.detach().clone() for gradient in gradients]
+                )
+
+                self.all_batch_input_marks.append(
+                    batch_x_mark.detach().clone()
+                )
+                self.all_batch_target_marks.append(
+                    batch_y_mark.detach().clone()
+                )
+
+                if config["update_model"]:
+                    for parameter, gradient in zip(
+                        model.parameters(), gradients
+                    ):
+                        parameter.grad = gradient.detach().clone()
+                    optimizer.step()
+
+                all_model_updates.append(
+                    [
+                        (value - state_before[name]).detach().clone()
+                        for name, value in model.state_dict().items()
+                    ]
+                )
         else:
             model_optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
 
@@ -1849,7 +3108,7 @@ class AttackTSInverseWorker(Worker):
                     }
                 attack_metrics.update(individual_evaluation)
 
-            if dataset_name not in CLASSIFICATION_DATASETS and attack_step % (num_attack_steps // log_plots_n_times) == 0:
+            if dataset_name not in CLASSIFICATION_DATASETS and dataset_name not in ETT_DATASETS and attack_step % (num_attack_steps // log_plots_n_times) == 0:
                 df, fig = plot_original_and_dummy_data(
                     config, sample_mapping, dummy_inputs, dummy_targets, batch_inputs, batch_targets
                 )
@@ -1857,10 +3116,18 @@ class AttackTSInverseWorker(Worker):
                 self._log_matplotlib_figure(fig, step=attack_step + attack_step_offset, log_name=f"_batch_{batch_number}")
 
             # Changes number of steps before new plots are logged for the MotionSense data
-            elif dataset_name == "motionsense" and attack_step % (num_attack_steps // log_plots_n_times) == 0:
+            elif attack_step % max(1, num_attack_steps // log_plots_n_times) == 0:
+                is_forecasting = dataset_name in ETT_DATASETS
                 for sample_idx in range(batch_inputs.shape[0]):
-                    df, fig = plot_channel_grid_original_vs_reconstructed(
-                        config, sample_mapping, dummy_inputs, batch_inputs, batch_number, sample_idx=sample_idx
+                    df, fig = plot_reconstruction(
+                        config,
+                        sample_mapping,
+                        dummy_inputs,
+                        batch_inputs,
+                        batch_number,
+                        sample_idx=sample_idx,
+                        dummy_targets=dummy_targets if is_forecasting else None,
+                        batch_targets=batch_targets if is_forecasting else None,
                     )
                     self._log_dataframe(df, attack_step + attack_step_offset, log_name=f"_batch_{batch_number}_sample_{sample_idx}")
                     self._log_matplotlib_figure(
@@ -2024,43 +3291,46 @@ def plot_original_and_dummy_data(config, sample_mapping, dummy_inputs, dummy_tar
 
     return df, fig
 
-def plot_channel_grid_original_vs_reconstructed(config, sample_mapping, dummy_inputs, batch_inputs, batch_number, sample_idx=0):
+
+def plot_channel_grid_original_vs_reconstructed(config, sample_mapping, dummy_inputs, batch_inputs, batch_number, sample_idx=0, **unused_kwargs):
+    # Only the input window is drawn. dummy_targets / batch_targets are accepted
+    # through **unused_kwargs so both plot functions share one call signature.
+    
     original = batch_inputs[sample_idx].detach().cpu().numpy()  # [seq_len, n_features]
     reconstructed = dummy_inputs[sample_mapping[sample_idx]].detach().cpu().numpy()
- 
+
     num_features = original.shape[-1]
- 
-    fig, axes = plt.subplots(2, num_features, figsize=(2.5 * num_features, 5), sharex=True)
- 
+    names = get_feature_names(config, num_features)
+
+    fig, axes = plt.subplots(
+        2, num_features, figsize=(2.5 * num_features, 5), sharex=True, squeeze=False
+    )
+
     for feature_idx in range(num_features):
-        feature_name = FEATURE_NAMES[feature_idx] if feature_idx < len(FEATURE_NAMES) else f"feature_{feature_idx}"
- 
         ax_original = axes[0, feature_idx]
         ax_reconstructed = axes[1, feature_idx]
- 
+
         ax_original.plot(original[:, feature_idx], color="tab:blue", linewidth=1.2)
         ax_reconstructed.plot(reconstructed[:, feature_idx], color="tab:orange", linewidth=1.2)
- 
-        ax_original.set_title(feature_name, fontsize=9)
- 
+
+        ax_original.set_title(names[feature_idx], fontsize=9)
+
         if feature_idx == 0:
             ax_original.set_ylabel("Original", fontsize=11)
             ax_reconstructed.set_ylabel("Reconstructed", fontsize=11)
- 
+
         ax_reconstructed.set_xlabel("Time step", fontsize=8)
- 
+
     fig.suptitle(
-        f'{config["dataset"]}: Batch {batch_number}'
-        f'\u2014 Original vs. Reconstructed by Channel',
+        f'{config["dataset"]}: Batch {batch_number} \u2014 Original vs. Reconstructed by Channel',
         fontsize=13,
     )
     fig.tight_layout(rect=[0, 0, 1, 0.93])
- 
+
     data = {}
     for feature_idx in range(num_features):
-        feature_name = FEATURE_NAMES[feature_idx] if feature_idx < len(FEATURE_NAMES) else f"feature_{feature_idx}"
-        data[f"original_{feature_name}"] = original[:, feature_idx]
-        data[f"reconstructed_{feature_name}"] = reconstructed[:, feature_idx]
+        data[f"original_{names[feature_idx]}"] = original[:, feature_idx]
+        data[f"reconstructed_{names[feature_idx]}"] = reconstructed[:, feature_idx]
     df = pd.DataFrame(data)
 
     if config["verbose"]:
@@ -2069,6 +3339,143 @@ def plot_channel_grid_original_vs_reconstructed(config, sample_mapping, dummy_in
         plt.close(fig)
 
     return df, fig
+
+
+def get_feature_names(config, num_features):
+    if config["dataset"] in ETT_DATASETS:
+        if config.get("features", "M") == "S":
+            names = [config.get("target", "OT")]
+        else:
+            names = ETT_FEATURE_NAMES
+    else:
+        names = FEATURE_NAMES
+    return [
+        names[i] if i < len(names) else f"feature_{i}"
+        for i in range(num_features)
+    ]
+
+
+def plot_overlay_original_vs_reconstructed(
+    config,
+    sample_mapping,
+    dummy_inputs,
+    batch_inputs,
+    batch_number,
+    sample_idx=0,
+    dummy_targets=None,
+    batch_targets=None,
+    max_cols=4,
+):
+    """One subplot per channel, original and reconstruction overlaid.
+
+    For forecasting data (ETT), the target horizon is drawn to the right of
+    a dotted vertical line, so history and forecast share one time axis.
+    """
+    j = sample_mapping[sample_idx]
+    original_in = batch_inputs[sample_idx].detach().cpu().numpy()  # [L, F]
+    recon_in = dummy_inputs[j].detach().cpu().numpy()
+    seq_len, num_features = original_in.shape
+
+    has_targets = (
+        batch_targets is not None
+        and dummy_targets is not None
+        and batch_targets.ndim == 3
+    )
+    if has_targets:
+        original_tg = batch_targets[sample_idx].detach().cpu().numpy()  # [P, T]
+        recon_tg = dummy_targets[j].detach().cpu().numpy()
+        pred_len = original_tg.shape[0]
+        # For features="MS" the targets only contain the last channel(s).
+        target_offset = num_features - original_tg.shape[-1]
+    else:
+        pred_len = 0
+        target_offset = 0
+
+    names = get_feature_names(config, num_features)
+    ncols = min(max_cols, num_features)
+    nrows = int(np.ceil(num_features / ncols))
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(4.5 * ncols, 2.8 * nrows), squeeze=False
+    )
+
+    input_x = np.arange(seq_len)
+    target_x = np.arange(seq_len, seq_len + pred_len)
+
+    for f in range(num_features):
+        ax = axes[f // ncols][f % ncols]
+        ax.plot(input_x, original_in[:, f], color="tab:blue",
+                linewidth=1.3, label="Original")
+        ax.plot(input_x, recon_in[:, f], color="tab:orange",
+                linewidth=1.3, linestyle="--", label="Reconstructed")
+
+        t = f - target_offset
+        if has_targets and t >= 0:
+            ax.plot(target_x, original_tg[:, t], color="tab:blue", linewidth=1.3)
+            ax.plot(target_x, recon_tg[:, t], color="tab:orange",
+                    linewidth=1.3, linestyle="--")
+            ax.axvline(seq_len - 0.5, color="gray", linestyle=":", linewidth=0.8)
+
+        ax.set_title(names[f], fontsize=9)
+        ax.set_xlabel("Time step", fontsize=8)
+        if f == 0:
+            ax.legend(fontsize=7)
+
+    # Hide unused axes in the last row.
+    for k in range(num_features, nrows * ncols):
+        axes[k // ncols][k % ncols].axis("off")
+
+    suffix = " (dotted line = forecast start)" if has_targets else ""
+    fig.suptitle(
+        f'{config["dataset"]}: Batch {batch_number}, Sample {sample_idx}'
+        f" \u2014 Original vs. Reconstructed{suffix}",
+        fontsize=12,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+    # DataFrame for wandb: one original/reconstructed column pair per channel.
+    total_len = seq_len + pred_len
+
+    def padded(inputs_col, targets_col):
+        col = np.full(total_len, np.nan)
+        col[:seq_len] = inputs_col
+        if targets_col is not None:
+            col[seq_len:] = targets_col
+        return col
+
+    data = {}
+    for f in range(num_features):
+        t = f - target_offset
+        use_t = has_targets and t >= 0
+        data[f"original_{names[f]}"] = padded(
+            original_in[:, f], original_tg[:, t] if use_t else None
+        )
+        data[f"reconstructed_{names[f]}"] = padded(
+            recon_in[:, f], recon_tg[:, t] if use_t else None
+        )
+    df = pd.DataFrame(data)
+
+    if config["verbose"]:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return df, fig
+
+RECONSTRUCTION_PLOT_FUNCTIONS = {
+    "channel_grid": plot_channel_grid_original_vs_reconstructed,
+    "overlay": plot_overlay_original_vs_reconstructed,
+}
+
+
+def plot_reconstruction(config, *args, **kwargs):
+    """Call the plot function selected by config['reconstruction_plot_style']."""
+    style = config.get("reconstruction_plot_style", "overlay")
+    if style not in RECONSTRUCTION_PLOT_FUNCTIONS:
+        raise ValueError(
+            f"Unknown reconstruction_plot_style {style!r}. "
+            f"Choose from {sorted(RECONSTRUCTION_PLOT_FUNCTIONS)}."
+        )
+    return RECONSTRUCTION_PLOT_FUNCTIONS[style](config, *args, **kwargs)
 
 def get_batch_sample_mapping(original_data, dummy_data, function=F.l1_loss):
     batch_size = original_data.shape[0]
@@ -2098,10 +3505,29 @@ def create_gradient_inversion_dataloader(
     aux_dataloader, model, config, batch_number, dummy_inputs, dummy_targets, seed_generator=None
 ):
     model.to(config["device"])
+    model.eval()
 
     folder_path = "../data/_model_dataset_gradients/"
+    task_kind = (
+        "classification_ce_v1"
+        if config["dataset"] in CLASSIFICATION_DATASETS
+        else "forecasting_mse_v1"
+    )
     # Path where the dataset will be saved or loaded from
-    dataset_path = f"{folder_path}grad_inputs_targets_dataset_{config['defense_name']}_{batch_number}_{model.name}_{'-'.join(map(str, model.features))}_{config['dataset']}_{len(aux_dataloader.dataset)}_{config['input_size']}_{config['output_size']}_{config['seed']}_{config['inversion_batch_size']}.pt"
+    if config["dataset"] in ETT_DATASETS:
+        # TODO: Include the complete configuration, victim weights, and
+        # auxiliary-data identity. Currently assumes one fixed setup per dataset.
+        dataset_path = (
+            f"{folder_path}grad_inputs_targets_dataset_"
+            f"{config.get('defense_name', 'none')}_"
+            f"ett_forecasting_mse_v1_{batch_number}_{model.name}_"
+            f"{config['dataset']}_{len(aux_dataloader.dataset)}_"
+            f"{dummy_inputs.shape[1]}_{dummy_inputs.shape[2]}_"
+            f"{dummy_targets.shape[1]}_{dummy_targets.shape[2]}_"
+            f"{config['seed']}_{config['inversion_batch_size']}.pt"
+        )
+    else:
+        dataset_path = f"{folder_path}grad_inputs_targets_dataset_{config.get('defense_name', 'none')}_{task_kind}_{batch_number}_{model.name}_{'-'.join(map(str, model.features))}_{config['dataset']}_{len(aux_dataloader.dataset)}_{config['input_size']}_{config['output_size']}_{config['seed']}_{config['inversion_batch_size']}.pt"
 
     # Check if the dataset file exists and load file
     if os.path.exists(dataset_path):
@@ -2113,30 +3539,161 @@ def create_gradient_inversion_dataloader(
         print("Creating gradient to inputs targets dataset:", dataset_path)
         config["loaded_grad_to_inputs_targets_dataset_from_file"] = False
         aux_dy_dx_inputs, aux_inputs_targets, aux_targets_targets = [], [], []
-        for i, (aux_batch_inputs, aux_batch_targets) in enumerate(aux_dataloader):
-            aux_batch_inputs, aux_batch_targets = (
-                aux_batch_inputs[:, :, model.features].to(config["device"]),
-                aux_batch_targets[:, :, 0].to(config["device"]),
-            )
+        for i, batch in enumerate(aux_dataloader):
+            model.zero_grad(set_to_none=True)
 
-            if aux_batch_inputs.shape[1] != dummy_inputs.shape[1]:
-                aux_batch_inputs = interpolate(aux_batch_inputs, dummy_inputs.shape[1])
-            if aux_batch_targets.shape[1] != dummy_targets.shape[1]:
-                aux_batch_targets = interpolate(aux_batch_targets.unsqueeze(-1), dummy_targets.shape[1]).squeeze(-1)
+            if config["dataset"] in ETT_DATASETS:
+                (
+                    aux_batch_inputs,
+                    aux_batch_targets,
+                    aux_input_marks,
+                    aux_target_marks,
+                ) = batch
 
-            model.zero_grad()
-            aux_out = model(aux_batch_inputs)
-            aux_y = F.mse_loss(aux_out, aux_batch_targets)
+                aux_batch_inputs = aux_batch_inputs.float().to(config["device"])
+                aux_batch_targets = aux_batch_targets.float().to(config["device"])
+                aux_input_marks = aux_input_marks.float().to(config["device"])
+                aux_target_marks = aux_target_marks.float().to(config["device"])
+
+                pred_len = dummy_targets.shape[1]
+
+                # The ETT loader returns label context followed by the future.
+                label_len = aux_batch_targets.shape[1] - pred_len
+                if not 0 <= label_len <= aux_batch_inputs.shape[1]:
+                    raise ValueError(
+                        "ETT auxiliary label context is incompatible "
+                        "with the input and prediction lengths."
+                    )
+
+                if aux_batch_inputs.shape[0] != 1:
+                    raise ValueError(
+                        "Auxiliary gradient generation expects one "
+                        "ETT window per batch."
+                    )
+
+                if aux_batch_inputs.shape[1:] != dummy_inputs.shape[1:]:
+                    raise ValueError(
+                        "ETT auxiliary input shape does not match "
+                        "the attacked input shape."
+                    )
+
+                dec_inp = torch.cat(
+                    [
+                        aux_batch_targets[:, :label_len, :],
+                        torch.zeros_like(
+                            aux_batch_targets[:, -pred_len:, :]
+                        ),
+                    ],
+                    dim=1,
+                )
+
+                aux_out = model(
+                    aux_batch_inputs,
+                    aux_input_marks,
+                    dec_inp,
+                    aux_target_marks,
+                )
+                if isinstance(aux_out, tuple):
+                    aux_out = aux_out[0]
+
+                f_dim = -1 if config.get("features", "M") == "MS" else 0
+                aux_out = aux_out[:, -pred_len:, f_dim:]
+                aux_batch_targets = aux_batch_targets[:, -pred_len:, f_dim:]
+
+                if aux_batch_targets.shape[1:] != dummy_targets.shape[1:]:
+                    raise ValueError(
+                        "ETT auxiliary target shape does not match "
+                        "the attacked target shape."
+                    )
+
+                if aux_out.shape != aux_batch_targets.shape:
+                    raise ValueError(
+                        f"ETT output shape {tuple(aux_out.shape)} "
+                        f"does not match target shape "
+                        f"{tuple(aux_batch_targets.shape)}."
+                    )
+
+                aux_y = F.mse_loss(aux_out, aux_batch_targets)
+
+            else:
+                # Existing dataset behavior.
+                aux_batch_inputs, aux_batch_targets = batch
+
+                if aux_batch_inputs.ndim != 3:
+                    raise ValueError(
+                        "Auxiliary MotionSense/MobiFall inputs must have shape "
+                        "[batch, time, features]; received "
+                        f"{tuple(aux_batch_inputs.shape)}"
+                    )
+
+                aux_batch_inputs = aux_batch_inputs[
+                    :, :, model.features
+                ].to(config["device"])
+
+                if aux_batch_inputs.shape[1] != dummy_inputs.shape[1]:
+                    aux_batch_inputs = interpolate(
+                        aux_batch_inputs, dummy_inputs.shape[1]
+                    )
+
+                if config["dataset"] in CLASSIFICATION_DATASETS:
+                    aux_batch_targets = aux_batch_targets.reshape(-1).to(
+                        config["device"],
+                        dtype=torch.long,
+                    )
+                    if aux_batch_targets.numel() != aux_batch_inputs.shape[0]:
+                        raise ValueError(
+                            "Expected one activity label per auxiliary window; "
+                            f"received inputs {tuple(aux_batch_inputs.shape)} "
+                            f"and labels {tuple(aux_batch_targets.shape)}"
+                        )
+
+                    aux_logits = model(aux_batch_inputs)
+                    aux_y = F.cross_entropy(
+                        aux_logits,
+                        aux_batch_targets,
+                    )
+                else:
+                    aux_batch_targets = aux_batch_targets[
+                        :, :, 0
+                    ].to(config["device"])
+
+                    if aux_batch_targets.shape[1] != dummy_targets.shape[1]:
+                        aux_batch_targets = interpolate(
+                            aux_batch_targets.unsqueeze(-1),
+                            dummy_targets.shape[1],
+                        ).squeeze(-1)
+
+                    aux_out = model(aux_batch_inputs)
+                    aux_y = F.mse_loss(aux_out, aux_batch_targets)
+
             aux_y.backward()
 
-            if "defense_name" in config:
+            if config["verbose"]:
+                if config["dataset"] in ETT_DATASETS:
+                    for name, parameter in model.named_parameters():
+                        if parameter.grad is None:
+                            raise RuntimeError(
+                                f"No auxiliary gradient for parameter {name!r}: "
+                                f"shape={tuple(parameter.shape)}, "
+                                f"requires_grad={parameter.requires_grad}."
+                            )
+
+                        if not torch.isfinite(parameter.grad).all():
+                            raise RuntimeError(
+                                f"Non-finite auxiliary gradient for parameter {name!r}."
+                            )
+
+            if config.get("defense_name", "none") not in {
+                None,
+                "none",
+            }:
                 # Apply gradient defenses
                 gradients = [param.grad for param in model.parameters()]
-                if "sign" in config:
+                if config.get("sign", False):
                     gradients = apply_sign_transformation(gradients)
-                if "prune_rate" in config:
+                if config.get("prune_rate") is not None:
                     gradients = apply_pruning(gradients, config["prune_rate"])
-                if "dp_epsilon" in config:
+                if config.get("dp_epsilon", 0) > 0:
                     gradients = add_gaussian_noise(gradients, config["dp_epsilon"])
 
                 # Update model parameters with modified gradients
@@ -2172,6 +3729,7 @@ def create_gradient_inversion_dataloader(
             shuffle=True,
             worker_init_fn=seed_worker,
             generator=seed_generator,
+            drop_last=True,
         )
     return grad_inputs_targets_dataset, DataLoader(
         grad_inputs_targets_dataset, batch_size=config["attack_batch_size"] * config["batch_size"]
@@ -2225,8 +3783,34 @@ def plot_quantile_dummy_data(config, sample_mapping, dummy_quantile_inputs, dumm
 
         # Plotting quantiles for dummy targets
         for q in range(num_quantiles):
-            dummy_target_quantiles = dummy_quantile_targets[j, :, q].detach().cpu().numpy()
-            ax.plot(original_x_axis[batch_inputs.shape[1] :], dummy_target_quantiles, label=f"Dummy Target Quantile {q} ({j})")
+            if config["dataset"] in ETT_DATASETS:
+                for feature in range(dummy_quantile_targets.shape[2]):
+                    dummy_target_quantiles = (
+                        dummy_quantile_targets[j, :, feature, q]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    ax.plot(
+                        original_x_axis[batch_inputs.shape[1]:],
+                        dummy_target_quantiles,
+                        label=(
+                            f"Dummy Target Feature {feature} "
+                            f"Quantile {q} ({j})"
+                        ),
+                    )
+            else:
+                dummy_target_quantiles = (
+                    dummy_quantile_targets[j, :, q]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+                ax.plot(
+                    original_x_axis[batch_inputs.shape[1]:],
+                    dummy_target_quantiles,
+                    label=f"Dummy Target Quantile {q} ({j})",
+                )
 
         ax.set_xlabel("Time" if i == batch_size - 1 else "")
         ax.set_ylabel("Output")
@@ -2238,6 +3822,53 @@ def plot_quantile_dummy_data(config, sample_mapping, dummy_quantile_inputs, dumm
     # Create weights and biases plot & dataframe
     fill_nan = np.empty(batch_targets.shape[1])
     fill_nan.fill(np.nan)
+    if config["dataset"] in ETT_DATASETS:
+        batch_targets_dict = {
+            f"batch_targets_{i}_{feature}": np.concatenate(
+                (
+                    fill_nan,
+                    batch_targets[i, :, feature].detach().cpu().numpy(),
+                )
+            )
+            for i in range(batch_targets.shape[0])
+            for feature in range(batch_targets.shape[2])
+        }
+
+        dummy_quantile_targets_dict = {
+            f"dummy_quantile_targets_{i}_{feature}_{q}": np.concatenate(
+                (
+                    fill_nan,
+                    dummy_quantile_targets[i, :, feature, q]
+                    .detach()
+                    .cpu()
+                    .numpy(),
+                )
+            )
+            for i in range(dummy_quantile_targets.shape[0])
+            for feature in range(dummy_quantile_targets.shape[2])
+            for q in range(dummy_quantile_targets.shape[3])
+        }
+    else:
+        batch_targets_dict = {
+            f"batch_targets_{i}": np.concatenate(
+                (
+                    fill_nan,
+                    batch_targets[i, :].detach().cpu().numpy(),
+                )
+            )
+            for i in range(batch_targets.shape[0])
+        }
+
+        dummy_quantile_targets_dict = {
+            f"dummy_quantile_targets_{i}_{q}": np.concatenate(
+                (
+                    fill_nan,
+                    dummy_quantile_targets[i, :, q].detach().cpu().numpy(),
+                )
+            )
+            for i in range(dummy_quantile_targets.shape[0])
+            for q in range(dummy_quantile_targets.shape[2])
+        }
     if len(batch_inputs.shape) == 3:
         batch_inputs_dict = {
             f"batch_inputs_{i}_{f}": np.concatenate((batch_inputs[i, :, f].detach().cpu().numpy(), fill_nan))
@@ -2309,6 +3940,8 @@ def featurewise_trend_regularization(x, loss, group_weights=None):
             continue
         for b in range(x.shape[0]):
             for feature in feature_indices:
+                if feature >= x.shape[2]:
+                    continue
                 weighted_losses.append(weight * trend_consistency_regularization(x[b : b + 1, :, feature], loss))
 
     if not weighted_losses:
