@@ -225,7 +225,9 @@ global_config = {
         "/scratch/ejk5818/ts-inverse/reconstructions/mobifall/"
     ),
 
-    "defense_name": "none",
+    "defense_name": "pruning",
+    "prune_rate": [0.01, 0.1, 0.2, 0.3, 0.4, 0.5],
+    # "dp_epsilon": [0.001, 0.01, 0.1, 1.0],
 }
 
 attack_config = [
@@ -247,7 +249,7 @@ attack_config = [
         'timegan_gifd_lr_decay': 'on_plateau_10',
         'timegan_gifd_sign_gradients': False,
         # invert attack
-        'num_learn_epochs': 1,
+        'num_learn_epochs': 0,
         'learn_learning_rate': 1e-3, 
         'attack_batch_size': 32,
         'inversion_batch_size': 1, # global_config['batch_size'],
@@ -284,7 +286,7 @@ attack_config = [
 
         ## Optimization attack
         'gradient_loss': ['l1'], 
-        'base_num_attack_steps': 10000,
+        'base_num_attack_steps': 2000,
         # 'after_effect': 'clamp_2',
         "perturbation_space": ["dct"],
         "after_effect": "none",
