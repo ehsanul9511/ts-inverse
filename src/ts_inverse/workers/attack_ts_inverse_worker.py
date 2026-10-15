@@ -2479,7 +2479,7 @@ class AttackTSInverseWorker(Worker):
 
             # Changes number of steps before new plots are logged for the MotionSense data
             elif attack_step % (num_attack_steps // log_plots_n_times) == 0:
-                is_forecasting = dataset_name in ETT_DATASETS
+                plot_targets_separate = config.get("plot_targets_separate", dataset_name in ETT_DATASETS)
                 reconstruction_plot_styles = config.get("reconstruction_plot_styles", ["overlay", "channel_grid"])
                 for style in reconstruction_plot_styles:
                     for sample_idx in range(batch_inputs.shape[0]):
@@ -2490,14 +2490,32 @@ class AttackTSInverseWorker(Worker):
                             batch_inputs,
                             batch_number,
                             sample_idx=sample_idx,
-                            dummy_targets=dummy_targets if is_forecasting else None,
-                            batch_targets=batch_targets if is_forecasting else None,
+                            plot_targets_separate=plot_targets_separate,
+                            dummy_targets=dummy_targets if not plot_targets_separate else None,
+                            batch_targets=batch_targets if not plot_targets_separate else None,
                             reconstruction_plot_style=style
                         )
                         self._log_dataframe(df, attack_step + attack_step_offset, log_name=f"_batch_{batch_number}_sample_{sample_idx}")
                         self._log_matplotlib_figure(
                             fig, step=attack_step + attack_step_offset, log_name=f"_batch_{batch_number}_sample_{sample_idx}_style_{style}", matplotlib_only=True
                         )
+                        if plot_targets_separate:
+                            df, fig = plot_reconstruction(
+                                config,
+                                sample_mapping,
+                                dummy_targets,
+                                batch_targets,
+                                batch_number,
+                                sample_idx=sample_idx,
+                                dummy_targets=None,
+                                batch_targets=None,
+                                reconstruction_plot_style=style,
+                                plot_targets_separate=True
+                            )
+                            self._log_dataframe(df, attack_step + attack_step_offset, log_name=f"_batch_{batch_number}_sample_{sample_idx}_targets")
+                            self._log_matplotlib_figure(
+                                fig, step=attack_step + attack_step_offset, log_name=f"_batch_{batch_number}_sample_{sample_idx}_targets_style_{style}", matplotlib_only=True
+                            )
             self._log_metrics(attack_metrics, step=attack_step + attack_step_offset)
 
             if config["verbose"]:

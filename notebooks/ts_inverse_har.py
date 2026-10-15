@@ -224,10 +224,10 @@ global_config = {
     "reconstruction_output_dir": (
         "/scratch/ejk5818/ts-inverse/reconstructions/mobifall/"
     ),
-    "defense_name": "none",
-    # "defense_name": "pruning",
+    # "defense_name": "none",
+    "defense_name": "dp",
     # "prune_rate": [0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9][-4:],
-    # "dp_epsilon": [0.001, 0.01, 0.1, 1.0],
+    "dp_epsilon": [0.001, 0.01, 0.1, 1.0][1:2],
 }
 
 attack_config = [
