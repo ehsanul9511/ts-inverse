@@ -60,6 +60,8 @@ FEATURE_GROUPS = {
     "rot_rate": [9, 10, 11],
 }
 
+ETT_FEATURE_NAMES = ["HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", "OT"]
+
 class AttackTSInverseWorker(Worker):
     def __init__(self, worker_id):
         self.worker_id = worker_id
@@ -2477,14 +2479,25 @@ class AttackTSInverseWorker(Worker):
 
             # Changes number of steps before new plots are logged for the MotionSense data
             elif attack_step % (num_attack_steps // log_plots_n_times) == 0:
-                for sample_idx in range(batch_inputs.shape[0]):
-                    df, fig = plot_channel_grid_original_vs_reconstructed(
-                        config, sample_mapping, dummy_inputs, batch_inputs, batch_number, sample_idx=sample_idx
-                    )
-                    self._log_dataframe(df, attack_step + attack_step_offset, log_name=f"_batch_{batch_number}_sample_{sample_idx}")
-                    self._log_matplotlib_figure(
-                        fig, step=attack_step + attack_step_offset, log_name=f"_batch_{batch_number}_sample_{sample_idx}", matplotlib_only=True
-                    )
+                is_forecasting = dataset_name in ETT_DATASETS
+                reconstruction_plot_styles = config.get("reconstruction_plot_styles", ["overlay", "channel_grid"])
+                for style in reconstruction_plot_styles:
+                    for sample_idx in range(batch_inputs.shape[0]):
+                        df, fig = plot_reconstruction(
+                            config,
+                            sample_mapping,
+                            dummy_inputs,
+                            batch_inputs,
+                            batch_number,
+                            sample_idx=sample_idx,
+                            dummy_targets=dummy_targets if is_forecasting else None,
+                            batch_targets=batch_targets if is_forecasting else None,
+                            reconstruction_plot_style=style
+                        )
+                        self._log_dataframe(df, attack_step + attack_step_offset, log_name=f"_batch_{batch_number}_sample_{sample_idx}")
+                        self._log_matplotlib_figure(
+                            fig, step=attack_step + attack_step_offset, log_name=f"_batch_{batch_number}_sample_{sample_idx}_style_{style}", matplotlib_only=True
+                        )
             self._log_metrics(attack_metrics, step=attack_step + attack_step_offset)
 
             if config["verbose"]:
@@ -2694,43 +2707,46 @@ def plot_original_and_dummy_data(config, sample_mapping, dummy_inputs, dummy_tar
 
     return df, fig
 
-def plot_channel_grid_original_vs_reconstructed(config, sample_mapping, dummy_inputs, batch_inputs, batch_number, sample_idx=0):
+
+def plot_channel_grid_original_vs_reconstructed(config, sample_mapping, dummy_inputs, batch_inputs, batch_number, sample_idx=0, **unused_kwargs):
+    # Only the input window is drawn. dummy_targets / batch_targets are accepted
+    # through **unused_kwargs so both plot functions share one call signature.
+    
     original = batch_inputs[sample_idx].detach().cpu().numpy()  # [seq_len, n_features]
     reconstructed = dummy_inputs[sample_mapping[sample_idx]].detach().cpu().numpy()
- 
+
     num_features = original.shape[-1]
- 
-    fig, axes = plt.subplots(2, num_features, figsize=(2.5 * num_features, 5), sharex=True)
- 
+    names = get_feature_names(config, num_features)
+
+    fig, axes = plt.subplots(
+        2, num_features, figsize=(2.5 * num_features, 5), sharex=True, squeeze=False
+    )
+
     for feature_idx in range(num_features):
-        feature_name = FEATURE_NAMES[feature_idx] if feature_idx < len(FEATURE_NAMES) else f"feature_{feature_idx}"
- 
         ax_original = axes[0, feature_idx]
         ax_reconstructed = axes[1, feature_idx]
- 
+
         ax_original.plot(original[:, feature_idx], color="tab:blue", linewidth=1.2)
         ax_reconstructed.plot(reconstructed[:, feature_idx], color="tab:orange", linewidth=1.2)
- 
-        ax_original.set_title(feature_name, fontsize=9)
- 
+
+        ax_original.set_title(names[feature_idx], fontsize=9)
+
         if feature_idx == 0:
             ax_original.set_ylabel("Original", fontsize=11)
             ax_reconstructed.set_ylabel("Reconstructed", fontsize=11)
- 
+
         ax_reconstructed.set_xlabel("Time step", fontsize=8)
- 
+
     fig.suptitle(
-        f'{config["dataset"]}: Batch {batch_number}'
-        f'\u2014 Original vs. Reconstructed by Channel',
+        f'{config["dataset"]}: Batch {batch_number} \u2014 Original vs. Reconstructed by Channel',
         fontsize=13,
     )
     fig.tight_layout(rect=[0, 0, 1, 0.93])
- 
+
     data = {}
     for feature_idx in range(num_features):
-        feature_name = FEATURE_NAMES[feature_idx] if feature_idx < len(FEATURE_NAMES) else f"feature_{feature_idx}"
-        data[f"original_{feature_name}"] = original[:, feature_idx]
-        data[f"reconstructed_{feature_name}"] = reconstructed[:, feature_idx]
+        data[f"original_{names[feature_idx]}"] = original[:, feature_idx]
+        data[f"reconstructed_{names[feature_idx]}"] = reconstructed[:, feature_idx]
     df = pd.DataFrame(data)
 
     if config["verbose"]:
@@ -2739,6 +2755,144 @@ def plot_channel_grid_original_vs_reconstructed(config, sample_mapping, dummy_in
         plt.close(fig)
 
     return df, fig
+
+def get_feature_names(config, num_features):
+    if config["dataset"] in ETT_DATASETS:
+        if config.get("features", "M") == "S":
+            names = [config.get("target", "OT")]
+        else:
+            names = ETT_FEATURE_NAMES
+    else:
+        names = FEATURE_NAMES
+    return [
+        names[i] if i < len(names) else f"feature_{i}"
+        for i in range(num_features)
+    ]
+
+
+def plot_overlay_original_vs_reconstructed(
+    config,
+    sample_mapping,
+    dummy_inputs,
+    batch_inputs,
+    batch_number,
+    sample_idx=0,
+    dummy_targets=None,
+    batch_targets=None,
+    max_cols=4,
+    **unused_kwargs
+):
+    """One subplot per channel, original and reconstruction overlaid.
+
+    For forecasting data (ETT), the target horizon is drawn to the right of
+    a dotted vertical line, so history and forecast share one time axis.
+    """
+    j = sample_mapping[sample_idx]
+    original_in = batch_inputs[sample_idx].detach().cpu().numpy()  # [L, F]
+    recon_in = dummy_inputs[j].detach().cpu().numpy()
+    seq_len, num_features = original_in.shape
+
+    has_targets = (
+        batch_targets is not None
+        and dummy_targets is not None
+        and batch_targets.ndim == 3
+    )
+    if has_targets:
+        original_tg = batch_targets[sample_idx].detach().cpu().numpy()  # [P, T]
+        recon_tg = dummy_targets[j].detach().cpu().numpy()
+        pred_len = original_tg.shape[0]
+        # For features="MS" the targets only contain the last channel(s).
+        target_offset = num_features - original_tg.shape[-1]
+    else:
+        pred_len = 0
+        target_offset = 0
+
+    names = get_feature_names(config, num_features)
+    ncols = min(max_cols, num_features)
+    nrows = int(np.ceil(num_features / ncols))
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(4.5 * ncols, 2.8 * nrows), squeeze=False
+    )
+
+    input_x = np.arange(seq_len)
+    target_x = np.arange(seq_len, seq_len + pred_len)
+
+    for f in range(num_features):
+        ax = axes[f // ncols][f % ncols]
+        ax.plot(input_x, original_in[:, f], color="tab:blue",
+                linewidth=1.3, label="Original")
+        ax.plot(input_x, recon_in[:, f], color="tab:orange",
+                linewidth=1.3, linestyle="--", label="Reconstructed")
+
+        t = f - target_offset
+        if has_targets and t >= 0:
+            ax.plot(target_x, original_tg[:, t], color="tab:blue", linewidth=1.3)
+            ax.plot(target_x, recon_tg[:, t], color="tab:orange",
+                    linewidth=1.3, linestyle="--")
+            ax.axvline(seq_len - 0.5, color="gray", linestyle=":", linewidth=0.8)
+
+        ax.set_title(names[f], fontsize=9)
+        ax.set_xlabel("Time step", fontsize=8)
+        if f == 0:
+            ax.legend(fontsize=7)
+
+    # Hide unused axes in the last row.
+    for k in range(num_features, nrows * ncols):
+        axes[k // ncols][k % ncols].axis("off")
+
+    suffix = " (dotted line = forecast start)" if has_targets else ""
+    fig.suptitle(
+        f'{config["dataset"]}: Batch {batch_number}, Sample {sample_idx}'
+        f" \u2014 Original vs. Reconstructed{suffix}",
+        fontsize=12,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+    # DataFrame for wandb: one original/reconstructed column pair per channel.
+    total_len = seq_len + pred_len
+
+    def padded(inputs_col, targets_col):
+        col = np.full(total_len, np.nan)
+        col[:seq_len] = inputs_col
+        if targets_col is not None:
+            col[seq_len:] = targets_col
+        return col
+
+    data = {}
+    for f in range(num_features):
+        t = f - target_offset
+        use_t = has_targets and t >= 0
+        data[f"original_{names[f]}"] = padded(
+            original_in[:, f], original_tg[:, t] if use_t else None
+        )
+        data[f"reconstructed_{names[f]}"] = padded(
+            recon_in[:, f], recon_tg[:, t] if use_t else None
+        )
+    df = pd.DataFrame(data)
+
+    if config["verbose"]:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return df, fig
+
+RECONSTRUCTION_PLOT_FUNCTIONS = {
+    "channel_grid": plot_channel_grid_original_vs_reconstructed,
+    "overlay": plot_overlay_original_vs_reconstructed,
+}
+
+
+def plot_reconstruction(config, *args, **kwargs):
+    """Call the plot function selected by config['reconstruction_plot_style']."""
+    # style = config.get("reconstruction_plot_style", "overlay")
+    style = kwargs.get("reconstruction_plot_style", "overlay")
+    if style not in RECONSTRUCTION_PLOT_FUNCTIONS:
+        raise ValueError(
+            f"Unknown reconstruction_plot_style {style!r}. "
+            f"Choose from {sorted(RECONSTRUCTION_PLOT_FUNCTIONS)}."
+        )
+    return RECONSTRUCTION_PLOT_FUNCTIONS[style](config, *args, **kwargs)
 
 def get_batch_sample_mapping(original_data, dummy_data, function=F.l1_loss):
     batch_size = original_data.shape[0]
