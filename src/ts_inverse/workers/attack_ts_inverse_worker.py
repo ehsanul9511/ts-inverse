@@ -1829,6 +1829,16 @@ class AttackTSInverseWorker(Worker):
 
             loss_function = nn.MSELoss()
 
+            # TODO: replace the model training loop below with FL simulation code
+            # Step-1: Create a loop spanning the number of epochs for FL. for now model_train_epochs is the number of epochs for FL
+            # Step-2: Create an inner loop spanning the number of clients. Try config.get("num_clients", 10) as the number of clients
+            # Step-3: Create a copy of the model, local_model. 
+            # Step-4: Fetch a batch from the model_train_loader and train the local_model on that batch for a few steps. In the next update, we will have separate train and test dataloaders for each client. For now, use the same model_train_loader for all clients.
+            # Step-5: Compute the gradients for the local_model and store them in a list. You can follow the code after the comment "Bookmark: gradient collection code" to compute the gradients for the local_model. Make sure to store the gradients in a list for each client.
+            # Step-6: The inner loop should end after all clients have been trained for a few steps. After that, outside the inner loop, compute the average of the gradients. 
+            # Step-7: Update the global model with the average gradients. Similar as gradient collection code but instead of storing the gradients, update the global model with the average gradients i.e. param.grad = average_gradients and then optimizer.step() to update the global model.
+
+
             # Train the forecasting model.
             for epoch in range(model_train_epochs):
                 model.train()
@@ -1937,6 +1947,7 @@ class AttackTSInverseWorker(Worker):
 
                 # Preserve model.parameters() ordering. Do not silently
                 # skip parameters or replace missing gradients with zeros.
+                # Bookmark: gradient collection code
                 gradients = []
                 for name, parameter in model.named_parameters():
                     # Fixed timestamp embeddings are model state, not gradient entries.
