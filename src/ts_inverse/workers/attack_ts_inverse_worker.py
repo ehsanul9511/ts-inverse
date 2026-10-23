@@ -53,14 +53,14 @@ FEATURE_NAMES = [
     "rot_rate_x", "rot_rate_y", "rot_rate_z",
 ]
 
-ETT_FEATURE_NAMES = ["HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", "OT"]
-
 FEATURE_GROUPS = {
     "acc": [0, 1, 2],
     "gyro": [3, 4, 5],
     "gravity": [6, 7, 8],
     "rot_rate": [9, 10, 11],
 }
+
+ETT_FEATURE_NAMES = ["HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", "OT"]
 
 class AttackTSInverseWorker(Worker):
     def __init__(self, worker_id):
@@ -279,7 +279,10 @@ class AttackTSInverseWorker(Worker):
                 self.targets_mean[0],
                 self.targets_std[0],
             )
-        config["model_size"] = sum(p.numel() for p in model.parameters())
+        config["model_size"] = sum(
+            p.numel() for p in model.parameters()
+            if config["dataset"] not in ETT_DATASETS or p.requires_grad
+        )
 
         if "aux_dataset" in config and config["aux_dataset"] is not None:
             aux_dataset_config = config["aux_dataset"]
@@ -420,14 +423,21 @@ class AttackTSInverseWorker(Worker):
                 ]
                 dataset_name = config["dataset"]
 
+                model_name = config["model"]
+
+                defense_name = "" if config.get("defense_name", "none") == "none" else f'_{config.get("defense_name", "none")}'
+
                 path_components = [
                     folder_path,
                     "grad_inputs_targets_model",
                     # str(batch_number),
                     dataset_name,
+                    model_name,
                 ]
 
-                return "_".join(path_components) + ".pt"
+                model_path = "_".join(path_components) + defense_name + ".pt"
+
+                return model_path
 
             folder_path = "../data/_model_dataset_gradients/"
             # TODO: Make the checkpoint path specific to the experiment configuration
@@ -534,14 +544,35 @@ class AttackTSInverseWorker(Worker):
                         regularization_targets.clone().requires_grad_(True)
                     )
 
-        optimization_space = [dummy_inputs]
+        perturbation_space = config.get("perturbation_space", "time")
 
-        if config["attack_targets"] and (
+        if (
+            perturbation_space == "dct"
+            and config.get("after_effect", "none") != "none"
+        ):
+            raise ValueError(
+                "DCT optimization currently requires after_effect='none'. "
+                "Time-domain clamping would require updating the "
+                "optimized coefficients as well."
+            )
+
+        optimize_targets = config["attack_targets"] and (
             config["dataset"] in ETT_DATASETS
             or config["batch_size"] > 1
             or not config["one_shot_targets"]
-        ):
-            optimization_space.append(dummy_targets)
+        )
+
+        input_variable, decode_inputs = prepare_attack_variable(
+            dummy_inputs, perturbation_space
+        )
+        optimization_space = [input_variable]
+
+        target_variable = dummy_targets
+        if optimize_targets:
+            target_variable, decode_targets = prepare_attack_variable(
+                dummy_targets, perturbation_space
+            )
+            optimization_space.append(target_variable)
 
         dummy_optimizer, dummy_schedular = self.set_attack_optimizer_and_schedular(
             optimization_space,
@@ -562,8 +593,16 @@ class AttackTSInverseWorker(Worker):
             }
 
             def closure():
+                nonlocal dummy_inputs, dummy_targets
+
                 dummy_optimizer.zero_grad()
                 model.zero_grad()
+
+                if perturbation_space == "dct":
+                    dummy_inputs = decode_inputs(input_variable)
+                    if optimize_targets:
+                        dummy_targets = decode_targets(target_variable)
+
                 zero_loss = dummy_inputs.new_zeros(())
                 loss_components = {
                     "gradient_matching": zero_loss,
@@ -637,11 +676,16 @@ class AttackTSInverseWorker(Worker):
                             dummy_out,
                             dummy_targets,
                         )
-                dummy_dy_dx = torch.autograd.grad(dummy_y, model.parameters(), create_graph=True)
+                dummy_dy_dx = torch.autograd.grad(
+                    dummy_y,
+                    [p for p in model.parameters()
+                     if config["dataset"] not in ETT_DATASETS or p.requires_grad],
+                    create_graph=True,
+                )
 
                 if attack_step >= config["num_attack_steps"]:
                     grad_dict, fig = self.plot_gradients(dummy_dy_dx, original_dy_dx, config)
-                    attack_metrics.update(grad_dict)
+                    # attack_metrics.update(grad_dict)
                     self._log_matplotlib_figure(
                         fig, attack_step + config["num_learn_epochs"], log_name="gradients", matplotlib_only=True
                     )
@@ -920,20 +964,20 @@ class AttackTSInverseWorker(Worker):
                 total_loss.backward()
 
                 if config["grad_signs_for_inputs"]:
-                    dummy_inputs.grad.sign_()
+                    input_variable.grad.sign_()
                 if config["dataset"] in ETT_DATASETS:
                     if (
                         config["attack_targets"]
                         and config["grad_signs_for_targets"]
                     ):
-                        if dummy_targets.grad is None:
+                        if target_variable.grad is None:
                             raise RuntimeError(
                                 "ETT target optimization is enabled, "
-                                "but dummy_targets has no gradient."
+                                "but target_variable has no gradient."
                             )
-                        dummy_targets.grad.sign_()
+                        target_variable.grad.sign_()
                 elif config["grad_signs_for_targets"]:
-                    dummy_targets.grad.sign_()
+                    target_variable.grad.sign_()
                 if (
                     "TCN" in model.name
                     and config["optimize_dropout"]
@@ -978,6 +1022,12 @@ class AttackTSInverseWorker(Worker):
             attack_metrics["grad_diff_loss_mse"] = (
                 loss_components["gradient_matching"].item()
             )
+
+            if perturbation_space == "dct":
+                with torch.no_grad():
+                    dummy_inputs = decode_inputs(input_variable)
+                    if optimize_targets:
+                        dummy_targets = decode_targets(target_variable)
 
             self.after_effect(config, model, dummy_inputs, dummy_targets, attack_step)
 
@@ -1055,697 +1105,6 @@ class AttackTSInverseWorker(Worker):
                 "Saved reconstructed data and gender:",
                 output_path,
             )
-
-    def _load_timegan_attack_prior(
-        self,
-        config,
-        batch_inputs,
-        batch_targets,
-    ):
-        dataset_name = config["dataset"]
-        if dataset_name not in {"motionsense", "mobifall"}:
-            raise ValueError(
-                "The TimeGAN GIFD experiment supports MotionSense and "
-                "MobiFall classification experiments."
-            )
-
-        unique_labels = torch.unique(batch_targets.detach()).cpu()
-        if unique_labels.numel() != 1:
-            raise ValueError(
-                "A TimeGAN GIFD attack batch must contain one activity. "
-                "Use batch_size=1, or construct activity-homogeneous batches."
-            )
-
-        activity_label = int(unique_labels.item())
-        if activity_label not in ACTIVITY_LABEL_TO_TIMEGAN_ACTIVITY:
-            raise ValueError(
-                f"Unsupported {dataset_name} activity label: "
-                f"{activity_label}"
-            )
-
-        activity = ACTIVITY_LABEL_TO_TIMEGAN_ACTIVITY[
-            activity_label
-        ]
-        checkpoint_path = (
-            Path(config["timegan_checkpoint_root"])
-            / activity
-            / "timegan_checkpoint.pt"
-        )
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(
-                f"TimeGAN checkpoint not found: {checkpoint_path}"
-            )
-
-        try:
-            checkpoint = torch.load(
-                checkpoint_path,
-                map_location="cpu",
-                weights_only=False,
-            )
-        except TypeError:
-            checkpoint = torch.load(
-                checkpoint_path,
-                map_location="cpu",
-            )
-
-        prior = _TimeGANAttackPrior(
-            checkpoint["timegan_config"]
-        )
-        states = checkpoint["state_dict"]
-        prior.generator.load_state_dict(
-            states["generator"],
-            strict=True,
-        )
-        prior.supervisor.load_state_dict(
-            states["supervisor"],
-            strict=True,
-        )
-        prior.recovery.load_state_dict(
-            states["recovery"],
-            strict=True,
-        )
-        prior = prior.to(batch_inputs.device).train()
-
-        for parameter in prior.parameters():
-            parameter.requires_grad_(False)
-
-        if prior.sequence_length != batch_inputs.shape[1]:
-            raise ValueError(
-                "TimeGAN sequence length does not match the victim input: "
-                f"{prior.sequence_length} != {batch_inputs.shape[1]}"
-            )
-        if dataset_name == "motionsense" and (
-            prior.data_dim != batch_inputs.shape[2]
-        ):
-            raise ValueError(
-                "TimeGAN feature count does not match the victim input: "
-                f"{prior.data_dim} != {batch_inputs.shape[2]}"
-            )
-        if dataset_name == "mobifall":
-            if batch_inputs.shape[2] != 9:
-                raise ValueError(
-                    "The MobiFall victim must use the nine native sensor "
-                    f"features; received {batch_inputs.shape[2]}"
-                )
-            if prior.data_dim not in {9, 12}:
-                raise ValueError(
-                    "The MobiFall TimeGAN prior must produce either nine "
-                    "native features or the 12 engineered features from "
-                    f"train_mobifall_timegan.py; received {prior.data_dim}"
-                )
-
-        preprocessing = checkpoint["preprocessing"]
-        if dataset_name == "mobifall" and prior.data_dim == 12:
-            if (
-                preprocessing.get("external_standardization_mean")
-                is not None
-                or preprocessing.get("external_standardization_std")
-                is not None
-            ):
-                raise ValueError(
-                    "The 12-to-9 MobiFall adapter requires a TimeGAN "
-                    "checkpoint trained without external standardization."
-                )
-        timegan_minimum = torch.as_tensor(
-            preprocessing["timegan_minimum"],
-            dtype=batch_inputs.dtype,
-            device=batch_inputs.device,
-        ).view(1, 1, -1)
-        timegan_range = torch.as_tensor(
-            preprocessing["timegan_range"],
-            dtype=batch_inputs.dtype,
-            device=batch_inputs.device,
-        ).view(1, 1, -1)
-
-        dataset = self.train_datasets[0]
-        if not hasattr(dataset, "normalization_mean") or not hasattr(
-            dataset,
-            "normalization_std",
-        ):
-            raise AttributeError(
-                f"{dataset_name} dataset normalization metadata is "
-                "missing."
-            )
-
-        classifier_mean = torch.as_tensor(
-            dataset.normalization_mean,
-            dtype=batch_inputs.dtype,
-            device=batch_inputs.device,
-        ).view(1, 1, -1)
-        classifier_std = torch.as_tensor(
-            dataset.normalization_std,
-            dtype=batch_inputs.dtype,
-            device=batch_inputs.device,
-        ).view(1, 1, -1)
-        classifier_std = classifier_std.clamp_min(1e-8)
-
-        print(
-            f"Loaded {activity} TimeGAN prior for {dataset_name} label "
-            f"{activity_label}: {checkpoint_path}"
-        )
-
-        return (
-            prior,
-            timegan_minimum,
-            timegan_range,
-            classifier_mean,
-            classifier_std,
-        )
-
-    @staticmethod
-    def _decode_timegan_for_classifier(
-        normalized_output,
-        timegan_minimum,
-        timegan_range,
-        classifier_mean,
-        classifier_std,
-        dataset_name,
-    ):
-        raw_output = (
-            normalized_output * timegan_range + timegan_minimum
-        )
-        if dataset_name == "mobifall" and raw_output.shape[-1] == 12:
-            # train_mobifall_timegan.py generated MotionSense-compatible
-            # channels. Convert them back to MobiFall's nine native sensor
-            # channels for the victim classifier:
-            #   acceleration = (gravity + user acceleration) * g
-            #   orientation APR = attitude RPY reordered and rad -> degree.
-            acceleration = (
-                raw_output[..., 3:6] + raw_output[..., 9:12]
-            ) * MOBIFALL_GRAVITY_M_S2
-            gyroscope = raw_output[..., 6:9]
-            orientation_apr = torch.rad2deg(
-                raw_output[..., [2, 1, 0]]
-            )
-            raw_output = torch.cat(
-                [acceleration, gyroscope, orientation_apr],
-                dim=-1,
-            )
-        return (
-            raw_output - classifier_mean
-        ) / classifier_std
-
-    @staticmethod
-    def _project_feature_l1_ball_(
-        feature,
-        reference,
-        radius,
-    ):
-        """Project each sample onto an L1 ball around its initial feature."""
-        with torch.no_grad():
-            if radius < 0:
-                raise ValueError(
-                    "timegan_gifd_feature_l1_radius must be non-negative"
-                )
-            if radius == 0:
-                feature.copy_(reference)
-                return
-
-            delta = (feature - reference).reshape(
-                feature.shape[0],
-                -1,
-            )
-            l1_norm = delta.abs().sum(dim=1)
-            outside = l1_norm > radius
-            if outside.any():
-                selected = delta[outside]
-                absolute = selected.abs()
-                sorted_absolute, _ = torch.sort(
-                    absolute,
-                    dim=1,
-                    descending=True,
-                )
-                cumulative = torch.cumsum(
-                    sorted_absolute,
-                    dim=1,
-                )
-                indexes = torch.arange(
-                    1,
-                    selected.shape[1] + 1,
-                    device=feature.device,
-                    dtype=feature.dtype,
-                ).view(1, -1)
-                positive = (
-                    sorted_absolute
-                    - (cumulative - radius) / indexes
-                ) > 0
-                rho = positive.sum(dim=1).clamp_min(1) - 1
-                theta = (
-                    cumulative.gather(1, rho.unsqueeze(1)).squeeze(1)
-                    - radius
-                ) / (rho.to(feature.dtype) + 1)
-                projected = selected.sign() * torch.clamp(
-                    absolute - theta.unsqueeze(1),
-                    min=0,
-                )
-                delta[outside] = projected
-
-            projected_feature = (
-                reference + delta.reshape_as(feature)
-            ).clamp(0.0, 1.0)
-            feature.copy_(projected_feature)
-
-    def _timegan_gifd_gradient_loss(
-        self,
-        model,
-        reconstructed_inputs,
-        dummy_targets,
-        original_dy_dx,
-        config,
-    ):
-        dummy_out = model(reconstructed_inputs)
-        dummy_y = nn.CrossEntropyLoss()(
-            dummy_out,
-            dummy_targets,
-        )
-        dummy_dy_dx = torch.autograd.grad(
-            dummy_y,
-            model.parameters(),
-            create_graph=True,
-        )
-        loss = self.gradient_loss_function(
-            dummy_dy_dx,
-            original_dy_dx,
-            config["gradient_loss"],
-        )
-
-        if config.get("total_variation_alpha_inputs", 0) > 0:
-            loss += (
-                config["total_variation_alpha_inputs"]
-                * total_variation_time_series(reconstructed_inputs)
-            )
-
-        lower_res_weight = config.get(
-            "lower_res_term_inputs",
-            config.get("lower_res_term", 0),
-        )
-        if lower_res_weight > 0:
-            with torch.no_grad():
-                warped_inputs = temporal_resolution_warping(
-                    reconstructed_inputs,
-                    2,
-                )
-                filtered_inputs = interpolate(
-                    warped_inputs,
-                    reconstructed_inputs.shape[1],
-                )
-            loss += lower_res_weight * F.l1_loss(
-                filtered_inputs,
-                reconstructed_inputs,
-            )
-
-        # if config.get("trend_term", 0) > 0:
-        #     loss += (
-        #         config["trend_term"]
-        #         * featurewise_trend_regularization(
-        #             reconstructed_inputs,
-        #             config["trend_loss"],
-        #         )
-        #     )
-
-
-        trend_weights = config.get("trend_term", {})
-
-        if any(weight > 0 for weight in trend_weights.values()):
-            trend_lr_term = 1.0
-
-            loss += (
-                trend_lr_term
-                * featurewise_trend_regularization(
-                    reconstructed_inputs,
-                    config["trend_loss"],
-                    group_weights=trend_weights,
-                )
-            )
-
-        if config.get("periodicity_term", 0) > 0:
-            loss += (
-                config["periodicity_term"]
-                * featurewise_periodicity_regularization(
-                    reconstructed_inputs,
-                    period=int(config["periodicity_period"]),
-                    loss=config["periodicity_loss"],
-                )
-            )
-
-        return loss
-
-    def _log_timegan_gifd_reconstruction(
-        self,
-        config,
-        batch_inputs,
-        batch_targets,
-        reconstructed_inputs,
-        dummy_targets,
-        batch_number,
-        attack_step,
-        loss,
-        extra_metrics,
-    ):
-        metrics = {
-            "step": attack_step,
-            "grad_diff_loss_mse": loss.detach().item(),
-            **extra_metrics,
-        }
-        self.evaluate_and_log_reconstruction(
-            config,
-            batch_inputs,
-            batch_targets,
-            reconstructed_inputs,
-            dummy_targets,
-            batch_number,
-            attack_step,
-            config["num_attack_steps"],
-            metrics,
-            attack_step_offset=config.get(
-                "num_learn_epochs",
-                0,
-            ),
-        )
-
-    def attack_batch_with_timegan_gifd(
-        self,
-        model,
-        config,
-        batch_number,
-        original_dy_dx,
-        dummy_targets,
-        batch_inputs,
-        batch_targets,
-    ):
-        """Optimize TimeGAN noise, then its generated feature sequence.
-
-        The second stage is the recurrent TimeGAN analogue of GIFD feature
-        domain optimization. Its search is constrained to an L1 ball around
-        the feature sequence produced at the end of latent optimization.
-        """
-        if config.get("attack_targets", False):
-            raise ValueError(
-                "TimeGAN GIFD assumes known activity labels; "
-                "set attack_targets=False."
-            )
-
-        latent_steps = int(config["timegan_gifd_latent_steps"])
-        feature_steps = int(config["timegan_gifd_feature_steps"])
-        total_steps = latent_steps + feature_steps
-        if total_steps <= 0:
-            raise ValueError(
-                "At least one TimeGAN GIFD optimization step is required."
-            )
-        if total_steps != config["num_attack_steps"]:
-            raise ValueError(
-                "num_attack_steps must equal TimeGAN latent plus feature "
-                "steps."
-            )
-
-        (
-            prior,
-            timegan_minimum,
-            timegan_range,
-            classifier_mean,
-            classifier_std,
-        ) = self._load_timegan_attack_prior(
-            config,
-            batch_inputs,
-            batch_targets,
-        )
-
-        dummy_targets = (
-            batch_targets.detach().clone().to(batch_inputs.device)
-        )
-        latent = torch.rand(
-            batch_inputs.shape[0],
-            prior.sequence_length,
-            prior.z_dim,
-            dtype=batch_inputs.dtype,
-            device=batch_inputs.device,
-            requires_grad=True,
-        )
-        log_interval = max(
-            1,
-            total_steps // min(total_steps, 200),
-        )
-
-        def decode_normalized(normalized_output):
-            return self._decode_timegan_for_classifier(
-                normalized_output,
-                timegan_minimum,
-                timegan_range,
-                classifier_mean,
-                classifier_std,
-                config["dataset"],
-            )
-
-        latent_optimizer, latent_scheduler = (
-            self.set_attack_optimizer_and_schedular(
-                [latent],
-                config.get(
-                    "timegan_gifd_optimizer",
-                    "adam",
-                ),
-                config["timegan_gifd_latent_learning_rate"],
-                config.get(
-                    "timegan_gifd_lr_decay",
-                    "on_plateau_10",
-                ),
-                max(latent_steps, 1),
-            )
-        )
-        if latent_optimizer is None:
-            raise ValueError(
-                "Unsupported TimeGAN GIFD optimizer: "
-                f"{config.get('timegan_gifd_optimizer')}"
-            )
-
-        print(
-            "TimeGAN GIFD stage 1/2: optimizing latent noise for "
-            f"{latent_steps} steps"
-        )
-        for stage_step in range(latent_steps):
-            attack_step = stage_step
-
-            def latent_closure():
-                latent_optimizer.zero_grad()
-                model.zero_grad()
-                reconstructed_inputs = decode_normalized(
-                    prior(latent)
-                )
-                loss = self._timegan_gifd_gradient_loss(
-                    model,
-                    reconstructed_inputs,
-                    dummy_targets,
-                    original_dy_dx,
-                    config,
-                )
-                loss.backward()
-                if config.get(
-                    "timegan_gifd_sign_gradients",
-                    False,
-                ):
-                    latent.grad.sign_()
-                return loss
-
-            loss = latent_optimizer.step(latent_closure)
-            with torch.no_grad():
-                latent.clamp_(0.0, 1.0)
-
-            scheduler_metrics = {}
-            self.schedular_step(
-                config.get(
-                    "timegan_gifd_lr_decay",
-                    "on_plateau_10",
-                ),
-                latent_scheduler,
-                scheduler_metrics,
-                loss,
-            )
-
-            if (
-                attack_step % log_interval == 0
-                or stage_step == latent_steps - 1
-            ):
-                with torch.no_grad():
-                    reconstructed_inputs = decode_normalized(
-                        prior(latent)
-                    )
-                self._log_timegan_gifd_reconstruction(
-                    config,
-                    batch_inputs,
-                    batch_targets,
-                    reconstructed_inputs,
-                    dummy_targets,
-                    batch_number,
-                    attack_step,
-                    loss,
-                    {
-                        "timegan_gifd/stage": 0,
-                        "timegan_gifd/latent_l2": (
-                            latent.detach().square().sum().sqrt().item()
-                        ),
-                        **scheduler_metrics,
-                    },
-                )
-
-        with torch.no_grad():
-            feature_reference = prior.generated_features(
-                latent
-            ).detach()
-        optimized_feature = (
-            feature_reference.clone().requires_grad_(True)
-        )
-        feature_radius = float(
-            config["timegan_gifd_feature_l1_radius"]
-        )
-
-        feature_optimizer, feature_scheduler = (
-            self.set_attack_optimizer_and_schedular(
-                [optimized_feature],
-                config.get(
-                    "timegan_gifd_optimizer",
-                    "adam",
-                ),
-                config[
-                    "timegan_gifd_feature_learning_rate"
-                ],
-                config.get(
-                    "timegan_gifd_lr_decay",
-                    "on_plateau_10",
-                ),
-                max(feature_steps, 1),
-            )
-        )
-        if feature_optimizer is None:
-            raise ValueError(
-                "Unsupported TimeGAN GIFD optimizer: "
-                f"{config.get('timegan_gifd_optimizer')}"
-            )
-
-        print(
-            "TimeGAN GIFD stage 2/2: optimizing generated features for "
-            f"{feature_steps} steps inside an L1 ball of radius "
-            f"{feature_radius}"
-        )
-        for stage_step in range(feature_steps):
-            attack_step = latent_steps + stage_step
-
-            def feature_closure():
-                feature_optimizer.zero_grad()
-                model.zero_grad()
-                reconstructed_inputs = decode_normalized(
-                    prior.decode_features(optimized_feature)
-                )
-                loss = self._timegan_gifd_gradient_loss(
-                    model,
-                    reconstructed_inputs,
-                    dummy_targets,
-                    original_dy_dx,
-                    config,
-                )
-                loss.backward()
-                if config.get(
-                    "timegan_gifd_sign_gradients",
-                    False,
-                ):
-                    optimized_feature.grad.sign_()
-                return loss
-
-            loss = feature_optimizer.step(feature_closure)
-            self._project_feature_l1_ball_(
-                optimized_feature,
-                feature_reference,
-                feature_radius,
-            )
-
-            scheduler_metrics = {}
-            self.schedular_step(
-                config.get(
-                    "timegan_gifd_lr_decay",
-                    "on_plateau_10",
-                ),
-                feature_scheduler,
-                scheduler_metrics,
-                loss,
-            )
-
-            if (
-                attack_step % log_interval == 0
-                or stage_step == feature_steps - 1
-            ):
-                with torch.no_grad():
-                    reconstructed_inputs = decode_normalized(
-                        prior.decode_features(optimized_feature)
-                    )
-                    feature_l1 = (
-                        optimized_feature - feature_reference
-                    ).abs().flatten(1).sum(dim=1).mean().item()
-                self._log_timegan_gifd_reconstruction(
-                    config,
-                    batch_inputs,
-                    batch_targets,
-                    reconstructed_inputs,
-                    dummy_targets,
-                    batch_number,
-                    attack_step,
-                    loss,
-                    {
-                        "timegan_gifd/stage": 1,
-                        "timegan_gifd/feature_l1": feature_l1,
-                        **scheduler_metrics,
-                    },
-                )
-
-        with torch.no_grad():
-            if feature_steps > 0:
-                reconstructed_inputs = decode_normalized(
-                    prior.decode_features(optimized_feature)
-                )
-            else:
-                reconstructed_inputs = decode_normalized(
-                    prior(latent)
-                )
-
-        self.all_dummy_inputs[batch_number] = (
-            reconstructed_inputs.detach().clone()
-        )
-        self.all_dummy_targets[batch_number] = (
-            dummy_targets.detach().clone()
-        )
-
-        final_mapping = get_batch_sample_mapping(
-            batch_inputs,
-            reconstructed_inputs,
-        )
-        reconstructed_data = (
-            reconstructed_inputs[final_mapping].detach().cpu()
-        )
-        corresponding_genders = (
-            self.all_batch_genders[batch_number].detach().cpu()
-        )
-        output_directory = config.get(
-            "reconstruction_output_dir",
-            "../data/_reconstructions",
-        )
-        os.makedirs(output_directory, exist_ok=True)
-        output_path = os.path.join(
-            output_directory,
-            (
-                f"{config['dataset']}_reconstruction_"
-                f"run_{config['run_number']}_"
-                f"batch_{batch_number}.pt"
-            ),
-        )
-        torch.save(
-            {
-                "reconstructed_data": reconstructed_data,
-                "gender": corresponding_genders,
-                "attack": "timegan_gifd",
-            },
-            output_path,
-        )
-        print(
-            "Saved TimeGAN GIFD reconstructed data and gender:",
-            output_path,
-        )
 
     def learned_prior_regularization(self, dummy_inputs, dummy_targets, regularization_inputs, regularization_targets, config):
         learned_prior_regularization = torch.zeros(1, device=dummy_inputs.device)
@@ -2470,6 +1829,166 @@ class AttackTSInverseWorker(Worker):
 
             loss_function = nn.MSELoss()
 
+            # TODO: replace the model training loop below with FL simulation code
+            # Step-1: Create a loop spanning the number of epochs for FL. for now model_train_epochs is the number of epochs for FL
+            # Step-2: Create an inner loop spanning the number of clients. Try config.get("num_clients", 10) as the number of clients
+            # Step-3: Create a copy of the model, local_model. 
+            # Step-4: Fetch a batch from the model_train_loader and train the local_model on that batch for a few steps. In the next update, we will have separate train and test dataloaders for each client. For now, use the same model_train_loader for all clients.
+            # Step-5: Compute the gradients for the local_model and store them in a list. You can follow the code after the comment "Bookmark: gradient collection code" to compute the gradients for the local_model. Make sure to store the gradients in a list for each client.
+            # Step-6: The inner loop should end after all clients have been trained for a few steps. After that, outside the inner loop, compute the average of the gradients. 
+            # Step-7: Update the global model with the average gradients. Similar as gradient collection code but instead of storing the gradients, update the global model with the average gradients i.e. param.grad = average_gradients and then optimizer.step() to update the global model.
+
+
+            # Keep between 10-100
+            num_clients = config.get("num_clients", 10)
+            local_steps = config.get("local_steps", 1)
+            local_lr = config.get("local_lr", 1e-3)
+
+
+            def next_batch(state):
+                # Draw from the shared loader, restarting it when exhausted.
+                try:
+                    return next(state["it"])
+                except StopIteration:
+                    state["it"] = iter(model_train_loader)
+                    return next(state["it"])
+
+
+            def ett_loss(m, batch):
+                batch_x, batch_y, batch_x_mark, batch_y_mark = (
+                    t.float().to(config["device"]) for t in batch
+                )
+                dec_inp = torch.cat(
+                    [batch_y[:, :label_len, :], torch.zeros_like(batch_y[:, -pred_len:, :])],
+                    dim=1,
+                )
+                outputs = m(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                if isinstance(outputs, tuple):
+                    outputs = outputs[0]
+                outputs = outputs[:, -pred_len:, f_dim:]
+                targets = batch_y[:, -pred_len:, f_dim:]
+
+                if outputs.shape != targets.shape:
+                    raise ValueError(
+                        f"ETT output shape {tuple(outputs.shape)} "
+                        f"does not match target shape {tuple(targets.shape)}."
+                    )
+                return loss_function(outputs, targets)
+
+            loader_state = {"it": iter(model_train_loader)}
+            debug_fl = config.get("debug_fl", True)
+
+            # Debug printouts are limit
+            debug_rounds = 100 
+
+
+            # Step 1
+            for epoch in range(model_train_epochs):
+                model.train()
+                client_gradients = []   # Step 5: one gradient list per client
+                round_loss = []
+
+                # Step 2
+                for client in range(num_clients):
+
+                    # Step 3
+                    local_model = deepcopy(model)
+                    local_model.train()
+                    local_optimizer = torch.optim.SGD(local_model.parameters(), lr=local_lr)
+
+                    # Step 4
+                    batch = next_batch(loader_state)
+                    for _ in range(local_steps):
+                        local_optimizer.zero_grad(set_to_none=True)
+                        loss = ett_loss(local_model, batch)
+                        loss.backward()
+                        local_optimizer.step()
+
+                    # Step 5
+                    local_model.zero_grad(set_to_none=True)
+                    loss = ett_loss(local_model, batch)
+                    loss.backward()
+                    round_loss.append(loss.item())
+
+                    # Bookmark: gradient collection code
+                    gradients = []
+                    for name, parameter in local_model.named_parameters():
+                        if not parameter.requires_grad:
+                            continue
+                        if parameter.grad is None:
+                            raise RuntimeError(f"No gradient for parameter {name!r}.")
+                        if not torch.isfinite(parameter.grad).all():
+                            raise RuntimeError(f"Non-finite gradient for {name!r}.")
+                        gradients.append(parameter.grad.detach().clone())
+
+
+                    # Optional: client-side defenses (the server only sees these)
+                    '''
+                    if config.get("defense_name", "none") not in {None, "none"}:
+                        if config.get("sign", False):
+                            gradients = apply_sign_transformation(gradients)
+                        if config.get("prune_rate") is not None:
+                            gradients = apply_pruning(gradients, config["prune_rate"])
+                        if config.get("dp_epsilon", 0) > 0:
+                            gradients = add_gaussian_noise(gradients, config["dp_epsilon"])
+                    '''
+
+                    client_gradients.append(gradients)
+
+
+                    # Debug printouts
+                    if debug_fl and epoch < debug_rounds:
+                        g0 = gradients[0]
+                        print(
+                            f"[FL debug] round {epoch + 1} client {client:02d} | "
+                            f"grad[0] shape={tuple(g0.shape)} "
+                            f"norm={g0.norm().item():.6f} "
+                            f"first5={g0.flatten()[:5].tolist()}"
+                        )
+
+                # Step 6
+                average_gradients = [
+                    torch.stack(per_param).mean(dim=0)
+                    for per_param in zip(*client_gradients)
+                ]
+
+                # Debug printouts
+                if debug_fl and epoch < debug_rounds:
+                    avg0 = average_gradients[0]
+                    print(
+                        f"[FL debug] round {epoch + 1} AVERAGE | "
+                        f"grad[0] shape={tuple(avg0.shape)} "
+                        f"norm={avg0.norm().item():.6f} "
+                        f"first5={avg0.flatten()[:5].tolist()}"
+                    )
+
+                    # Independent check: recompute the mean by hand.
+                    manual_avg0 = sum(cg[0] for cg in client_gradients) / len(client_gradients)
+                    print(
+                        "[FL debug] max |avg - manual avg| ="
+                        f" {(avg0 - manual_avg0).abs().max().item():.3e}"
+                    )
+
+                    # Are clients actually different from each other?
+                    stacked0 = torch.stack([cg[0] for cg in client_gradients])
+                    print(
+                        "[FL debug] mean per-element std across clients ="
+                        f" {stacked0.std(dim=0).mean().item():.3e}"
+                    )
+
+                # Step 7
+                optimizer.zero_grad(set_to_none=True)
+                for parameter, gradient in zip(
+                    (p for p in model.parameters() if p.requires_grad), average_gradients
+                ):
+                    parameter.grad = gradient
+                optimizer.step()
+
+                print(
+                    f"FL round {epoch + 1:02d}/{model_train_epochs} | "
+                    f"mean client MSE {np.mean(round_loss):.6f}"
+                )
+            '''
             # Train the forecasting model.
             for epoch in range(model_train_epochs):
                 model.train()
@@ -2522,7 +2041,7 @@ class AttackTSInverseWorker(Worker):
                     f"ETT epoch {epoch + 1:02d}/{model_train_epochs} | "
                     f"MSE {epoch_squared_error / epoch_target_elements:.6f}"
                 )
-
+            '''
             # Record deterministic gradients, with dropout disabled.
             # Reconstruction must also use model.eval().
             model.eval()
@@ -2578,8 +2097,12 @@ class AttackTSInverseWorker(Worker):
 
                 # Preserve model.parameters() ordering. Do not silently
                 # skip parameters or replace missing gradients with zeros.
+                # Bookmark: gradient collection code
                 gradients = []
                 for name, parameter in model.named_parameters():
+                    # Fixed timestamp embeddings are model state, not gradient entries.
+                    if not parameter.requires_grad:
+                        continue
                     if parameter.grad is None:
                         raise RuntimeError(
                             f"No gradient recorded for parameter {name!r}: "
@@ -2623,7 +2146,7 @@ class AttackTSInverseWorker(Worker):
 
                 if config["update_model"]:
                     for parameter, gradient in zip(
-                        model.parameters(), gradients
+                        (p for p in model.parameters() if p.requires_grad), gradients
                     ):
                         parameter.grad = gradient.detach().clone()
                     optimizer.step()
@@ -3116,24 +2639,48 @@ class AttackTSInverseWorker(Worker):
                 self._log_matplotlib_figure(fig, step=attack_step + attack_step_offset, log_name=f"_batch_{batch_number}")
 
             # Changes number of steps before new plots are logged for the MotionSense data
-            elif attack_step % max(1, num_attack_steps // log_plots_n_times) == 0:
-                is_forecasting = dataset_name in ETT_DATASETS
-                for sample_idx in range(batch_inputs.shape[0]):
-                    df, fig = plot_reconstruction(
-                        config,
-                        sample_mapping,
-                        dummy_inputs,
-                        batch_inputs,
-                        batch_number,
-                        sample_idx=sample_idx,
-                        dummy_targets=dummy_targets if is_forecasting else None,
-                        batch_targets=batch_targets if is_forecasting else None,
-                    )
-                    self._log_dataframe(df, attack_step + attack_step_offset, log_name=f"_batch_{batch_number}_sample_{sample_idx}")
-                    self._log_matplotlib_figure(
-                        fig, step=attack_step + attack_step_offset, log_name=f"_batch_{batch_number}_sample_{sample_idx}", matplotlib_only=True
-                    )
+            elif attack_step % (num_attack_steps // log_plots_n_times) == 0:
+                plot_targets_separate = config.get("plot_targets_separate", dataset_name in ETT_DATASETS)
+                reconstruction_plot_styles = config.get("reconstruction_plot_styles", ["overlay", "channel_grid"])
+                for style in reconstruction_plot_styles:
+                    for sample_idx in range(batch_inputs.shape[0]):
+                        df, fig = plot_reconstruction(
+                            config,
+                            sample_mapping,
+                            dummy_inputs,
+                            batch_inputs,
+                            batch_number,
+                            sample_idx=sample_idx,
+                            plot_targets_separate=plot_targets_separate,
+                            dummy_targets=dummy_targets if not plot_targets_separate else None,
+                            batch_targets=batch_targets if not plot_targets_separate else None,
+                            reconstruction_plot_style=style
+                        )
+                        self._log_dataframe(df, attack_step + attack_step_offset, log_name=f"_batch_{batch_number}_sample_{sample_idx}")
+                        self._log_matplotlib_figure(
+                            fig, step=attack_step + attack_step_offset, log_name=f"_batch_{batch_number}_sample_{sample_idx}_style_{style}", matplotlib_only=True
+                        )
+                        if plot_targets_separate:
+                            df, fig = plot_reconstruction(
+                                config,
+                                sample_mapping,
+                                dummy_targets,
+                                batch_targets,
+                                batch_number,
+                                sample_idx=sample_idx,
+                                dummy_targets=None,
+                                batch_targets=None,
+                                reconstruction_plot_style=style,
+                                plot_targets_separate=True
+                            )
+                            self._log_dataframe(df, attack_step + attack_step_offset, log_name=f"_batch_{batch_number}_sample_{sample_idx}_targets")
+                            self._log_matplotlib_figure(
+                                fig, step=attack_step + attack_step_offset, log_name=f"_batch_{batch_number}_sample_{sample_idx}_targets_style_{style}", matplotlib_only=True
+                            )
             self._log_metrics(attack_metrics, step=attack_step + attack_step_offset)
+
+            if config["verbose"]:
+                print(f"Attack Step {attack_step + attack_step_offset}: {attack_metrics}")
 
     def plot_gradients(self, dummy_dy_dx, original_dy_dx, config):
         """Plot all gradients along the x-axis as bars. The goal is to show the values"""
@@ -3214,6 +2761,54 @@ class AttackTSInverseWorker(Worker):
                     dummy_inputs.data = torch.clamp(dummy_inputs, 0)
                     dummy_targets.data = torch.clamp(dummy_targets, 0)
 
+def prepare_attack_variable(x, space="time"):
+    """Return an optimizer variable and a differentiable decoder.
+
+    x: [batch, time] or [batch, time, features].
+    The transform acts only along the time dimension.
+    """
+    if space == "time":
+        # Preserve the existing tensor and optimization behavior.
+        return x, lambda value: value
+
+    if space != "dct":
+        raise ValueError(f"Unknown perturbation_space: {space!r}")
+
+    if x.ndim not in (2, 3) or not x.is_floating_point():
+        raise ValueError(
+            "DCT requires floating-point data shaped "
+            "[batch, time] or [batch, time, features]."
+        )
+
+    length = x.shape[1]
+    if length == 0:
+        raise ValueError("Cannot transform an empty time dimension.")
+
+    # Orthonormal DCT-II matrix: basis[frequency, time].
+    frequencies = torch.arange(
+        length, device=x.device, dtype=x.dtype
+    ).unsqueeze(1)
+    times = torch.arange(
+        length, device=x.device, dtype=x.dtype
+    ).unsqueeze(0)
+
+    basis = torch.cos(
+        (torch.pi / length) * frequencies * (times + 0.5)
+    )
+    basis = basis * (2.0 / length) ** 0.5
+    basis[0] = basis[0] / (2.0 ** 0.5)
+
+    # Initialize coefficients from the existing dummy initialization.
+    coefficients = (
+        x.detach().movedim(1, -1) @ basis.T
+    ).movedim(-1, 1).contiguous().requires_grad_(True)
+
+    def decode(value):
+        return (
+            value.movedim(1, -1) @ basis
+        ).movedim(-1, 1).contiguous()
+
+    return coefficients, decode
 
 def plot_original_and_dummy_data(config, sample_mapping, dummy_inputs, dummy_targets, batch_inputs, batch_targets):
     batch_size = batch_inputs.shape[0]
@@ -3340,7 +2935,6 @@ def plot_channel_grid_original_vs_reconstructed(config, sample_mapping, dummy_in
 
     return df, fig
 
-
 def get_feature_names(config, num_features):
     if config["dataset"] in ETT_DATASETS:
         if config.get("features", "M") == "S":
@@ -3365,6 +2959,7 @@ def plot_overlay_original_vs_reconstructed(
     dummy_targets=None,
     batch_targets=None,
     max_cols=4,
+    **unused_kwargs
 ):
     """One subplot per channel, original and reconstruction overlaid.
 
@@ -3469,7 +3064,8 @@ RECONSTRUCTION_PLOT_FUNCTIONS = {
 
 def plot_reconstruction(config, *args, **kwargs):
     """Call the plot function selected by config['reconstruction_plot_style']."""
-    style = config.get("reconstruction_plot_style", "overlay")
+    # style = config.get("reconstruction_plot_style", "overlay")
+    style = kwargs.get("reconstruction_plot_style", "overlay")
     if style not in RECONSTRUCTION_PLOT_FUNCTIONS:
         raise ValueError(
             f"Unknown reconstruction_plot_style {style!r}. "
@@ -3506,6 +3102,10 @@ def create_gradient_inversion_dataloader(
 ):
     model.to(config["device"])
     model.eval()
+    gradient_parameters = [
+        p for p in model.parameters()
+        if config["dataset"] not in ETT_DATASETS or p.requires_grad
+    ]
 
     folder_path = "../data/_model_dataset_gradients/"
     task_kind = (
@@ -3671,6 +3271,8 @@ def create_gradient_inversion_dataloader(
             if config["verbose"]:
                 if config["dataset"] in ETT_DATASETS:
                     for name, parameter in model.named_parameters():
+                        if not parameter.requires_grad:
+                            continue
                         if parameter.grad is None:
                             raise RuntimeError(
                                 f"No auxiliary gradient for parameter {name!r}: "
@@ -3688,7 +3290,7 @@ def create_gradient_inversion_dataloader(
                 "none",
             }:
                 # Apply gradient defenses
-                gradients = [param.grad for param in model.parameters()]
+                gradients = [param.grad for param in gradient_parameters]
                 if config.get("sign", False):
                     gradients = apply_sign_transformation(gradients)
                 if config.get("prune_rate") is not None:
@@ -3697,10 +3299,10 @@ def create_gradient_inversion_dataloader(
                     gradients = add_gaussian_noise(gradients, config["dp_epsilon"])
 
                 # Update model parameters with modified gradients
-                for param, grad in zip(model.parameters(), gradients):
+                for param, grad in zip(gradient_parameters, gradients):
                     param.grad = grad
 
-            flattened_aux_dy_dx = torch.cat([p.grad.detach().view(-1) for p in model.parameters()]).unsqueeze(
+            flattened_aux_dy_dx = torch.cat([p.grad.detach().view(-1) for p in gradient_parameters]).unsqueeze(
                 0
             )  # add batch dimension but is always 1
 
