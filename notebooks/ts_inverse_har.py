@@ -286,7 +286,7 @@ attack_config = [
 
         ## Optimization attack
         'gradient_loss': ['l1'], 
-        'base_num_attack_steps': 2000,
+        'base_num_attack_steps': 5000,
         # 'after_effect': 'clamp_2',
         "perturbation_space": ["dct"],
         "after_effect": "none",
@@ -303,6 +303,8 @@ attack_config = [
         'grad_signs_for_dropouts': True, #[False, True],
 
         'attack_number_of_batches': 1,
+        "eval_ts2vec": True,
+        "eval_catch22": True,
     },
 ]
 
@@ -333,7 +335,7 @@ model_config = [
     {
         # "_model": iTransformer,
         "_model": Transformer,
-        "_attack_step_multiplier": 10,
+        "_attack_step_multiplier": 1,
     }
 ]
 # For testing

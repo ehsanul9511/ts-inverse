@@ -586,7 +586,7 @@ class AttackTSInverseWorker(Worker):
         if config["dataset"] not in CLASSIFICATION_DATASETS and config["dataset"] not in ETT_DATASETS:
             plot_original_and_dummy_data(config, sample_mapping, dummy_inputs, dummy_targets, batch_inputs, batch_targets)
 
-        for attack_step in range(0, config["num_attack_steps"] + 1):
+        for attack_step in tqdm(range(0, config["num_attack_steps"] + 1), disable=not config["verbose"]):
             attack_metrics = {
                 "step": attack_step + config["num_learn_epochs"],
                 "sample_mapping": sample_mapping,
@@ -1034,7 +1034,7 @@ class AttackTSInverseWorker(Worker):
             self.schedular_step(config["attack_opti_lr_decay"], dummy_schedular, attack_metrics, dy_dx_loss)
 
             # Should calcualte evalaution metrics and log them
-            if attack_step % (config["num_attack_steps"] // min(config["num_attack_steps"], 200)) == 0:
+            if attack_step % (config["num_attack_steps"] // min(config["num_attack_steps"], 1)) == 0 or attack_step == config["num_attack_steps"]:
                 self.evaluate_and_log_reconstruction(
                     config,
                     batch_inputs,
@@ -1048,12 +1048,14 @@ class AttackTSInverseWorker(Worker):
                     attack_step_offset=config["num_learn_epochs"],
                 )
 
+
         self.all_dummy_inputs[batch_number] = (
             dummy_inputs.detach().clone()
         )
         self.all_dummy_targets[batch_number] = (
             dummy_targets.detach().clone()
         )
+
 
         if config["dataset"] == "motionsense":
             # Match reconstructed samples to the order of the original batch.
@@ -1105,6 +1107,53 @@ class AttackTSInverseWorker(Worker):
                 "Saved reconstructed data and gender:",
                 output_path,
             )
+
+        elif config["dataset"] in ETT_DATASETS:
+            # Match reconstructed samples to the order of the original batch.
+            final_mapping = get_batch_sample_mapping(
+                batch_inputs,
+                dummy_inputs,
+            )
+
+            reconstructed_data = (
+                dummy_inputs[final_mapping]
+                .detach()
+                .cpu()
+            )
+
+            output_directory = config.get(
+                "reconstruction_output_dir",
+                "reconstructions",
+            )
+
+            os.makedirs(
+                output_directory,
+                exist_ok=True,
+            )
+
+            output_path = os.path.join(
+                output_directory,
+                (
+                    f"ett_reconstruction_"
+                    f"run_{config['run_number']}_"
+                    f"batch_{batch_number}.pt"
+                ),
+            )
+
+            torch.save(
+                {
+                    "reconstructed_data": reconstructed_data,
+                    "original_data": batch_inputs.detach().cpu(),
+                },
+                output_path,
+            )
+
+            print(
+                "Saved reconstructed data and original data:",
+                output_path,
+            )
+
+            
 
     def learned_prior_regularization(self, dummy_inputs, dummy_targets, regularization_inputs, regularization_targets, config):
         learned_prior_regularization = torch.zeros(1, device=dummy_inputs.device)
@@ -2459,6 +2508,24 @@ class AttackTSInverseWorker(Worker):
                 }
             attack_metrics.update(mean_evaluation)
 
+            # Optional evaluation only; existing datasets/configs remain unchanged.
+            if dataset_name in ETT_DATASETS and (
+                config.get("eval_ts2vec", False) or config.get("eval_catch22", False)
+            ):
+                interval = int(config.get("extra_eval_interval", 0))
+                if interval < 0:
+                    raise ValueError("extra_eval_interval must be nonnegative.")
+                if attack_step >= num_attack_steps or (interval > 0 and attack_step % interval == 0):
+                    from .reconstruction_metrics import ETTReconstructionEvaluator
+                    if not hasattr(self, "_ett_reconstruction_evaluator"):
+                        self._ett_reconstruction_evaluator = ETTReconstructionEvaluator(
+                            config, self.val_datasets, self.test_datasets
+                        )
+                    attack_metrics.update(self._ett_reconstruction_evaluator.evaluate(
+                        batch_inputs, dummy_inputs[sample_mapping], prefix="inputs"
+                    ))
+
+
             # individual batch sample metrics
             for i, j in enumerate(sample_mapping):
                 if dataset_name in CLASSIFICATION_DATASETS:
@@ -2489,7 +2556,7 @@ class AttackTSInverseWorker(Worker):
                 self._log_matplotlib_figure(fig, step=attack_step + attack_step_offset, log_name=f"_batch_{batch_number}")
 
             # Changes number of steps before new plots are logged for the MotionSense data
-            elif attack_step % (num_attack_steps // log_plots_n_times) == 0:
+            elif attack_step % (num_attack_steps // log_plots_n_times) == 0 or attack_step == num_attack_steps - 1:
                 plot_targets_separate = config.get("plot_targets_separate", dataset_name in ETT_DATASETS)
                 reconstruction_plot_styles = config.get("reconstruction_plot_styles", ["overlay", "channel_grid"])
                 for style in reconstruction_plot_styles:
