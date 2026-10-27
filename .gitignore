@@ -28,3 +28,5 @@ reconstructions/*
 *.csv
 *.png
 ideal_household_scripts/*
+
+models/*

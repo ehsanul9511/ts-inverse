@@ -7,6 +7,7 @@ import torch.nn as nn
 import psutil
 
 from ts_inverse.models.iTransformer import Model as iTransformer
+from ts_inverse.models.Transformer import Model as Transformer
 
 import os
 username = os.getenv("USER")
@@ -197,8 +198,8 @@ global_config = {
     'experiment_name': 'ts-inverse_batch1_without_target_reconst_12-6-2024',
     # 'seed': [10, 43, 28, 80, 71], # 28, 80, 71],
     'seed': [43], # 28, 80, 71],
-    'batch_size': 1,
-    'device': 'cpu',
+    'batch_size': [1, 2, 4, 8, 16, 32, 64][:1],
+    'device': 'cuda',
     'verbose': True,
     'pool_size': 1,
     'run_number': -1,
@@ -221,14 +222,12 @@ global_config = {
     "model_train_learning_rate": 1e-3,
 
     "reconstruction_output_dir": (
-        "/scratch/ddl5280/research/ts-inverse/reconstructions/mobifall/"
+        "/scratch/ejk5818/ts-inverse/reconstructions/mobifall/"
     ),
-
-    "defense_name": "none",
-
-    # "overlay" = one subplot per channel, original and reconstruction overlaid
-    # "channel_grid" = 2-row grid per channel: original on top, reconstruction below
-    "reconstruction_plot_style": "channel_grid",
+    # "defense_name": "none",
+    "defense_name": "dp",
+    # "prune_rate": [0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9][-4:],
+    "dp_epsilon": [0.001, 0.01, 0.1, 1.0][1:2],
 }
 
 attack_config = [
@@ -287,9 +286,10 @@ attack_config = [
 
         ## Optimization attack
         'gradient_loss': ['l1'], 
-        'base_num_attack_steps': 500,
+        'base_num_attack_steps': 5000,
         # 'after_effect': 'clamp_2',
-        'after_effect': 'none',
+        "perturbation_space": ["dct"],
+        "after_effect": "none",
         'optimization_learning_rate': 0.01, 
         'attack_opti_optimizer': ['adam'],
         'attack_opti_lr_decay': ['on_plateau_10'],
@@ -298,11 +298,13 @@ attack_config = [
         'clamp_dropout_min_max': [[0.0, 1.0]],
         'dropout_probability_regularizer': [1e-5], #1e-6, 1e-7, 1e-8],
         'dropout_mask_init_type': 'halves', #['bernoulli', 'halves', 'uniform', 'p', '1-p'], #['halves', 'bernoulli'],
-        'grad_signs_for_inputs': True,
+        'grad_signs_for_inputs': False,
         'grad_signs_for_targets': False,
         'grad_signs_for_dropouts': True, #[False, True],
 
         'attack_number_of_batches': 1,
+        "eval_ts2vec": True,
+        "eval_catch22": True,
     },
 ]
 
@@ -331,8 +333,9 @@ dataset_config = [
 
 model_config = [
     {
-        "_model": iTransformer,
-        "_attack_step_multiplier": 10,
+        # "_model": iTransformer,
+        "_model": Transformer,
+        "_attack_step_multiplier": 1,
     }
 ]
 # For testing

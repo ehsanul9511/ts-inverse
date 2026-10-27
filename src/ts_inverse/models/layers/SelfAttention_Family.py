@@ -141,24 +141,107 @@ class FullAttention(nn.Module):
 
     def forward(self, queries, keys, values, attn_mask, tau=None, delta=None):
         B, L, H, E = queries.shape
-        _, S, _, D = values.shape
         scale = self.scale or 1. / sqrt(E)
+
+        def describe(name, tensor):
+            x = tensor.detach()
+            finite = torch.isfinite(x)
+            finite_values = x[finite]
+            value_range = (
+                f"[{finite_values.min().item():.6g}, "
+                f"{finite_values.max().item():.6g}]"
+                if finite_values.numel()
+                else "no finite values"
+            )
+            return (
+                f"{name}: shape={tuple(x.shape)}, dtype={x.dtype}, "
+                f"device={x.device}, finite_range={value_range}, "
+                f"nan={torch.isnan(x).sum().item()}, "
+                f"+inf={torch.isposinf(x).sum().item()}, "
+                f"-inf={torch.isneginf(x).sum().item()}"
+            )
+
+        def fail(stage, **tensors):
+            details = "\n".join(
+                describe(name, tensor)
+                for name, tensor in tensors.items()
+            )
+            raise RuntimeError(
+                f"\nATTENTION FAILURE: {stage}\n"
+                f"mask_flag={self.mask_flag}, scale={scale}, "
+                f"training={self.training}\n{details}"
+            )
+
+        for name, tensor in (
+            ("queries", queries),
+            ("keys", keys),
+            ("values", values),
+        ):
+            if not torch.isfinite(tensor).all().item():
+                fail(f"non-finite {name} entering attention", **{name: tensor})
 
         scores = torch.einsum("blhe,bshe->bhls", queries, keys)
 
+        if not torch.isfinite(scores).all().item():
+            fail(
+                "query-key multiplication produced NaN/Inf",
+                queries=queries,
+                keys=keys,
+                scores=scores,
+            )
+
         if self.mask_flag:
             if attn_mask is None:
-                attn_mask = TriangularCausalMask(B, L, device=queries.device)
+                attn_mask = TriangularCausalMask(
+                    B, L, device=queries.device
+                )
 
-            scores.masked_fill_(attn_mask.mask, -np.inf)
+            mask = attn_mask.mask
+            fully_masked = mask.all(dim=-1)
+            if fully_masked.any().item():
+                rows = fully_masked.nonzero(as_tuple=False)[:10].tolist()
+                raise RuntimeError(
+                    f"ATTENTION FAILURE: fully masked query rows: {rows}"
+                )
 
-        A = self.dropout(torch.softmax(scale * scores, dim=-1))
+            scores.masked_fill_(mask, -np.inf)
+
+        logits = scale * scores
+
+        if torch.isnan(logits).any().item() or torch.isposinf(logits).any().item():
+            fail(
+                "invalid logits after masking/scaling",
+                queries=queries,
+                keys=keys,
+                logits=logits,
+            )
+
+        if torch.isneginf(logits).all(dim=-1).any().item():
+            fail("all-negative-infinity softmax row", logits=logits)
+
+        probabilities = torch.softmax(logits, dim=-1)
+
+        if not torch.isfinite(probabilities).all().item():
+            fail(
+                "softmax produced NaN/Inf despite valid logits",
+                logits=logits,
+                probabilities=probabilities,
+            )
+
+        A = self.dropout(probabilities)
         V = torch.einsum("bhls,bshd->blhd", A, values)
 
+        if not torch.isfinite(V).all().item():
+            fail(
+                "attention-value multiplication produced NaN/Inf",
+                attention=A,
+                values=values,
+                output=V,
+            )
+
         if self.output_attention:
-            return (V.contiguous(), A)
-        else:
-            return (V.contiguous(), None)
+            return V.contiguous(), A
+        return V.contiguous(), None
 
 
 # Code implementation from https://github.com/zhouhaoyi/Informer2020

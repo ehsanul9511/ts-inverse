@@ -1302,6 +1302,67 @@ def get_mean_std_dataloader(
             )
         )
     
+def get_mean_std_dataloader(
+    data_loader,
+    device="cpu",
+    target_length=None,
+):
+    """Calculate per-channel statistics over batch and time dimensions."""
+    if target_length is not None:
+        input_count, target_count = 0, 0
+
+        if target_length is not None and target_length <= 0:
+            raise ValueError("target_length must be positive.")
+
+        inputs_sum, inputs_sum_sq = 0.0, 0.0
+        targets_sum, targets_sum_sq = 0.0, 0.0
+
+        for batch in data_loader:
+            inputs, targets = batch[0], batch[1]
+
+            if target_length is not None:
+                if targets.ndim != 3 or targets.shape[1] < target_length:
+                    raise ValueError(
+                        "Expected targets shaped [batch, time, features] "
+                        "with enough steps for target_length."
+                    )
+                targets = targets[:, -target_length:, :]
+
+            inputs = inputs.reshape(-1, inputs.size(-1)).double()
+            targets = targets.reshape(-1, targets.size(-1)).double()
+
+            inputs_sum += inputs.sum(dim=0)
+            inputs_sum_sq += inputs.square().sum(dim=0)
+            input_count += inputs.shape[0]
+
+            targets_sum += targets.sum(dim=0)
+            targets_sum_sq += targets.square().sum(dim=0)
+            target_count += targets.shape[0]
+
+        if input_count == 0 or target_count == 0:
+            raise ValueError("Cannot calculate statistics from an empty loader.")
+
+        inputs_mean = inputs_sum / input_count
+        targets_mean = targets_sum / target_count
+
+        inputs_std = (
+            inputs_sum_sq / input_count - inputs_mean.square()
+        ).clamp_min(0).sqrt()
+
+        targets_std = (
+            targets_sum_sq / target_count - targets_mean.square()
+        ).clamp_min(0).sqrt()
+
+        return tuple(
+            value.to(device=device, dtype=torch.float32)
+            for value in (
+                inputs_mean,
+                inputs_std,
+                targets_mean,
+                targets_std,
+            )
+        )
+    
     inputs_sum_, inputs_sum_sq = 0.0, 0.0
     targets_sum_, targets_sum_sq = 0.0, 0.0
     total_samples = 0
