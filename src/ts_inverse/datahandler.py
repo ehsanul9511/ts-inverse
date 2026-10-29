@@ -272,10 +272,128 @@ def get_har_dataset(
     data_set_test  = IMUDataset(data_test, label_test)
     return [data_set_train], [data_set_valid], [data_set_test]
 
-class Dataset_ETT_hour(Dataset):
+ETT_STAMP_PREFIX = "stamp_"
+
+
+def load_ett_dataframe(
+    root_path,
+    data_path,
+    flag="train",
+    seq_len=96,
+    features="M",
+    target="OT",
+    scale=True,
+    timeenc=0,
+    freq="h",
+    minute_level=False,
+):
+    """
+    Dataframe version of Dataset_ETT_*.__read_data__.
+
+    Returns (frame, scaler). `frame` holds the scaled feature columns followed
+    by the time-stamp columns (all prefixed with ETT_STAMP_PREFIX), for the
+    requested split only, sorted by date.
+
+    Borders follow the iTransformer data_loader:
+      hourly : 12/4/4 months of 30 days * 24 h
+      minute : same, times 4 (15-minute sampling)
+    """
+    assert flag in ["train", "test", "val"]
+    set_type = {"train": 0, "val": 1, "test": 2}[flag]
+
+    unit = 30 * 24 * (4 if minute_level else 1)  # one "month" in rows
+    border1s = [0, 12 * unit - seq_len, 12 * unit + 4 * unit - seq_len]
+    border2s = [12 * unit, 12 * unit + 4 * unit, 12 * unit + 8 * unit]
+    border1, border2 = border1s[set_type], border2s[set_type]
+
+    df_raw = pd.read_csv(os.path.join(root_path, data_path))
+
+    if features in ("M", "MS"):
+        df_data = df_raw[df_raw.columns[1:]]
+    elif features == "S":
+        df_data = df_raw[[target]]
+    else:
+        raise ValueError(f"Unknown features mode {features!r}")
+
+    # Scaler is always fit on the train split only (rows border1s[0]:border2s[0]).
+    scaler = StandardScaler()
+    if scale:
+        scaler.fit(df_data[border1s[0]:border2s[0]].values)
+        values = scaler.transform(df_data.values)
+    else:
+        values = df_data.values
+
+    frame = pd.DataFrame(values, columns=df_data.columns)
+    frame["date"] = pd.to_datetime(df_raw["date"])
+
+    # Slice the split, then sort the WHOLE frame (features + date together)
+    # so data and time stamps can never fall out of alignment.
+    frame = (
+        frame.iloc[border1:border2]
+        .sort_values("date", kind="stable")
+        .reset_index(drop=True)
+    )
+
+    # Time stamps are built from the sorted dates, then the date column is dropped.
+    date = frame["date"]
+    if timeenc == 0:
+        stamp = pd.DataFrame(
+            {
+                "month": date.dt.month,
+                "day": date.dt.day,
+                "weekday": date.dt.weekday,
+                "hour": date.dt.hour,
+            }
+        )
+        if minute_level:
+            stamp["minute"] = date.dt.minute // 15
+    elif timeenc == 1:
+        # NOTE: time_features is not imported in this module (same as the
+        # original classes). Import it from the iTransformer utils if needed.
+        arr = time_features(pd.to_datetime(date.values), freq=freq).transpose(1, 0)
+        stamp = pd.DataFrame(arr)
+    else:
+        raise ValueError(f"Unknown timeenc {timeenc!r}")
+
+    stamp.columns = [f"{ETT_STAMP_PREFIX}{c}" for c in stamp.columns]
+    frame = pd.concat([frame.drop(columns=["date"]), stamp], axis=1)
+    return frame, scaler
+
+
+def split_dataframe_equally(frame, num_clients):
+    """Split into `num_clients` contiguous, equal-length dataframes.
+
+    Contiguous (not shuffled) so sliding windows stay valid inside each client.
+    Up to num_clients - 1 trailing rows are dropped so all clients are equal.
+    """
+    if num_clients < 1:
+        raise ValueError("num_clients must be >= 1.")
+    rows_per_client = len(frame) // num_clients
+    if rows_per_client == 0:
+        raise ValueError(
+            f"Cannot split {len(frame)} rows into {num_clients} clients."
+        )
+    return [
+        frame.iloc[i * rows_per_client:(i + 1) * rows_per_client].reset_index(drop=True)
+        for i in range(num_clients)
+    ]
+
+class _ETTFromDataFrameMixin:
+    """Dataframe -> Dataset constructor (the final block of __read_data__)."""
+
+    def _build_from_dataframe(self, dataframe, scaler=None):
+        stamp_cols = [c for c in dataframe.columns if str(c).startswith(ETT_STAMP_PREFIX)]
+        data_cols = [c for c in dataframe.columns if c not in stamp_cols]
+
+        self.scaler = scaler if scaler is not None else StandardScaler()
+        self.data_x = dataframe[data_cols].values
+        self.data_y = dataframe[data_cols].values
+        self.data_stamp = dataframe[stamp_cols].values
+
+class Dataset_ETT_hour(_ETTFromDataFrameMixin, Dataset):
     def __init__(self, root_path, flag='train', size=None,
                  features='S', data_path='ETTh1.csv',
-                 target='OT', scale=True, timeenc=0, freq='h'):
+                 target='OT', scale=True, timeenc=0, freq='h', dataframe=None, scaler=None):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -299,7 +417,10 @@ class Dataset_ETT_hour(Dataset):
  
         self.root_path = root_path
         self.data_path = data_path
-        self.__read_data__()
+        if dataframe is not None:
+            self._build_from_dataframe(dataframe, scaler)
+        else:
+            self.__read_data__()
  
     def __read_data__(self):
         self.scaler = StandardScaler()
@@ -361,10 +482,10 @@ class Dataset_ETT_hour(Dataset):
         return self.scaler.inverse_transform(data)
  
  
-class Dataset_ETT_minute(Dataset):
+class Dataset_ETT_minute(_ETTFromDataFrameMixin, Dataset):
     def __init__(self, root_path, flag='train', size=None,
                  features='S', data_path='ETTm1.csv',
-                 target='OT', scale=True, timeenc=0, freq='t'):
+                 target='OT', scale=True, timeenc=0, freq='t', dataframe=None, scaler=None):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -388,7 +509,10 @@ class Dataset_ETT_minute(Dataset):
  
         self.root_path = root_path
         self.data_path = data_path
-        self.__read_data__()
+        if dataframe is not None:
+            self._build_from_dataframe(dataframe, scaler)
+        else:
+            self.__read_data__()
  
     def __read_data__(self):
         self.scaler = StandardScaler()
@@ -519,6 +643,61 @@ def get_ett_dataset(
  
     return [train_dataset], [validation_dataset], [test_dataset]
 
+def get_ett_client_datasets(
+    dataset="ETTh1",
+    root_path=None,
+    data_path=None,
+    num_clients=10,
+    seq_len=96,
+    label_len=48,
+    pred_len=96,
+    features="M",
+    target="OT",
+    scale=True,
+    timeenc=0,
+    freq="h",
+):
+    """Split the ETT TRAIN split into `num_clients` equal datasets (one per FL client)."""
+    if root_path is None:
+        raise ValueError("root_path must be specified for ETT dataset.")
+    if dataset not in ETT_DATASET_CLASSES:
+        raise ValueError(
+            f"Unknown ETT dataset '{dataset}'. "
+            f"Choose from {list(ETT_DATASET_CLASSES.keys())}."
+        )
+    if data_path is None:
+        data_path = f"{dataset}.csv"
+
+    dataset_class = ETT_DATASET_CLASSES[dataset]
+    minute_level = dataset_class is Dataset_ETT_minute
+
+    frame, scaler = load_ett_dataframe(
+        root_path=root_path, data_path=data_path, flag="train",
+        seq_len=seq_len, features=features, target=target, scale=scale,
+        timeenc=timeenc, freq=freq, minute_level=minute_level,
+    )
+    client_frames = split_dataframe_equally(frame, num_clients)
+
+    min_rows = seq_len + pred_len
+    if len(client_frames[0]) < min_rows:
+        raise ValueError(
+            f"Each client has {len(client_frames[0])} rows but needs at least "
+            f"{min_rows} (seq_len + pred_len). Use fewer clients."
+        )
+
+    client_datasets = [
+        dataset_class(
+            root_path=root_path, flag="train", size=[seq_len, label_len, pred_len],
+            features=features, data_path=data_path, target=target, scale=scale,
+            timeenc=timeenc, freq=freq, dataframe=client_frame, scaler=scaler,
+        )
+        for client_frame in client_frames
+    ]
+    print(
+        f"{dataset}: {num_clients} clients x {len(client_frames[0])} rows "
+        f"-> {len(client_datasets[0])} windows per client"
+    )
+    return client_datasets
 
 class TimeSeriesDataSet(Dataset):
     """

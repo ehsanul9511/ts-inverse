@@ -37,6 +37,7 @@ from ts_inverse.datahandler import (
     get_har_dataset,
     get_motionsense_dataset,
     get_ett_dataset,
+    get_ett_client_datasets,
 )
 from .forecasting_worker import evaluate_model
 
@@ -145,6 +146,37 @@ class AttackTSInverseWorker(Worker):
             worker_init_fn=seed_worker,
             generator=self.g,
         )
+
+        # Per-client datasets/dataloaders for FL simulation (ETT only).
+        # train_dataloader above is kept untouched: it is still used for mean/std.
+        self.client_datasets = None
+        self.client_dataloaders = None
+        if dataset_name in ETT_DATASETS:
+            num_clients = d_c.get("num_clients", c.get("num_clients", 10))
+            self.client_datasets = get_ett_client_datasets(
+                dataset=dataset_name,
+                root_path=d_c["root_path"],
+                data_path=d_c.get("data_path"),
+                num_clients=num_clients,
+                seq_len=d_c.get("seq_len", 96),
+                label_len=d_c.get("label_len", 48),
+                pred_len=d_c.get("pred_len", 96),
+                features=d_c.get("features", "M"),
+                target=d_c.get("target", "OT"),
+                scale=d_c.get("scale", True),
+                timeenc=d_c.get("timeenc", 0),
+                freq=d_c.get("freq", "h"),
+            )
+            self.client_dataloaders = [
+                DataLoader(
+                    client_dataset,
+                    batch_size=c.get("model_train_batch_size", 32),
+                    shuffle=True,
+                    worker_init_fn=seed_worker,
+                    generator=self.g,
+                )
+                for client_dataset in self.client_datasets
+            ]
 
         (
             self.inputs_mean,
