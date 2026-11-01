@@ -3,7 +3,6 @@ import dotenv
 dotenv.load_dotenv()
 
 import torch
-import torch.nn as nn
 import psutil
 
 from ts_inverse.models.iTransformer import Model as iTransformer
@@ -13,118 +12,10 @@ import os
 username = os.getenv("USER")
 
 data_path_dict = {
-    # "ejk5818": "/scratch/ejk5818/ts-inverse/data/motion-sense/",
     "ejk5818": "/scratch/ejk5818/ts-inverse/data/ETT-small/",
     "ddl5280": "/scratch/ddl5280/research/ts-inverse/data/ETT/",
 }
 
-class MotionSenseActivityCNN(nn.Module):
-    """
-    Activity-only PyTorch version of the MTCNN architecture used in
-    1_MotionSense_Trial.ipynb and Table 2 of the paper.
-
-    The shared CNN trunk is preserved. The gender head is removed,
-    leaving only the four-class activity head.
-    """
-
-    def __init__(
-        self,
-        num_features=12,
-        window_size=50,
-        num_classes=4,
-    ):
-        super().__init__()
-
-        self.name = "MotionSenseActivityCNN"
-        self.features = list(range(num_features))
-
-        self.feature_extractor = nn.Sequential(
-            # Keras Conv2D(50, (1, 5), padding="valid")
-            nn.Conv2d(
-                in_channels=1,
-                out_channels=50,
-                kernel_size=(1, 5),
-            ),
-            nn.ReLU(),
-
-            # Keras Conv2D(50, (1, 3), padding="same")
-            nn.Conv2d(
-                in_channels=50,
-                out_channels=50,
-                kernel_size=(1, 3),
-                padding=(0, 1),
-            ),
-            nn.ReLU(),
-
-            # Keras Dense(50), applied independently at each
-            # feature/time position.
-            nn.Conv2d(
-                in_channels=50,
-                out_channels=50,
-                kernel_size=1,
-            ),
-            nn.ReLU(),
-
-            nn.MaxPool2d(kernel_size=(1, 2)),
-            nn.Dropout(0.2),
-
-            # Keras Conv2D(40, (1, 5), padding="valid")
-            nn.Conv2d(
-                in_channels=50,
-                out_channels=40,
-                kernel_size=(1, 5),
-            ),
-            nn.ReLU(),
-
-            # Keras Dense(40)
-            nn.Conv2d(
-                in_channels=40,
-                out_channels=40,
-                kernel_size=1,
-            ),
-            nn.ReLU(),
-
-            nn.MaxPool2d(kernel_size=(1, 3)),
-            nn.Dropout(0.2),
-
-            # Keras Conv2D(20, (1, 3), padding="valid")
-            nn.Conv2d(
-                in_channels=40,
-                out_channels=20,
-                kernel_size=(1, 3),
-            ),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-        )
-
-        # Determine the flatten size without hard-coding it.
-        with torch.no_grad():
-            dummy = torch.zeros(
-                1,
-                1,
-                num_features,
-                window_size,
-            )
-            flattened_size = self.feature_extractor(dummy).numel()
-
-        self.activity_head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(flattened_size, 400),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(400, num_classes),
-        )
-
-    def forward(self, x):
-        # Worker supplies [batch, time, features].
-        x = x.transpose(1, 2)
-
-        # Conv2d expects [batch, channel, feature, time].
-        x = x.unsqueeze(1)
-
-        x = self.feature_extractor(x)
-        return self.activity_head(x)
-    
 # Check if CUDA is available
 if torch.cuda.is_available():
     # Get the current device
@@ -167,19 +58,11 @@ def start_multi_process(g_config, a_config, d_config, m_config, pool_size):
             g_config.update(a_config)
             for m_config in search_model_settings:
                 for d_config in search_dataset_settings:
-                    if d_config["dataset"] == "motionsense":
-                        fa_models_config = {
-                            "features": [list(range(12))],
-                            "input_size": d_config["seq_len"],
-                            # The target is one scalar activity class.
-                            "output_size": 1,
-                        }
-                    else:
-                        fa_models_config = {
-                            "features": [[0]],
-                            "input_size": d_config["observation_days"],
-                            "output_size": d_config["future_days"],
-                        }
+                    fa_models_config = {
+                        "features": [[0]],
+                        "input_size": d_config["observation_days"],
+                        "output_size": d_config["future_days"],
+                    }
                     search_for_all_models_settings = list(grid_search_params(fa_models_config))
                     for fa_models_config in search_for_all_models_settings:
                         g_config['run_number'] = len(search_args)
@@ -193,12 +76,12 @@ def start_multi_process(g_config, a_config, d_config, m_config, pool_size):
 
 
 global_config = {
-    'logger_service': 'wandb',
-    # 'logger_service': 'none',
+    # 'logger_service': 'wandb',
+    'logger_service': 'none',
     'experiment_name': 'ts-inverse_batch1_without_target_reconst_12-6-2024',
     # 'seed': [10, 43, 28, 80, 71], # 28, 80, 71],
     'seed': [43], # 28, 80, 71],
-    'batch_size': [1, 2, 4, 8, 16, 32, 64][3:],
+    'batch_size': [1, 2, 4, 8, 16, 32, 64][4:5],
     'device': 'cuda',
     'verbose': True,
     'pool_size': 1,
@@ -272,10 +155,10 @@ attack_config = [
         #     'gravity': 0.01,
         #     'rot_rate': 0.01,
         # }],
-        'trend_term': [0.1],
+        'trend_term': [0],
         'trend_loss': ['l1_mean'],
         'trend_reduce_lr': [False],
-        'periodicity_term': [0.1],
+        'periodicity_term': [0],
         'periodicity_loss': ['l1_mean'],
         "periodicity_period": [25],
         'periodicity_reduce_lr': [False],
@@ -312,11 +195,6 @@ dataset_config = [
     {
         "dataset": "ETTh1",
         "root_path": data_path_dict[username] if username in data_path_dict else None,
-        # "data_path": data_path_dict[username] if username in data_path_dict else None,
-        # "seq_len": 50,
-        # "stride": 10,
-        # "num_features": 12,
-        # "num_classes": 4,
         "seq_len": 96,
         "label_len": 48,
         "pred_len": 96,
