@@ -125,6 +125,13 @@ class AttackTSInverseWorker(Worker):
                 worker_init_fn=seed_worker,
                 generator=self.g,
             )
+            self.val_dataloader = DataLoader(
+                ConcatDataset(self.val_datasets),
+                batch_size=c["batch_size"],
+                shuffle=False,
+                worker_init_fn=seed_worker,
+                generator=self.g,
+            )
         else:
             train_dataloader = DataLoader(
                 ConcatSliceDataset(self.train_datasets),
@@ -133,6 +140,15 @@ class AttackTSInverseWorker(Worker):
                 worker_init_fn=seed_worker,
                 generator=self.g,
             )
+            self.val_dataloader = DataLoader(
+                ConcatSliceDataset(self.val_datasets),
+                batch_size=1024,
+                shuffle=False,
+                worker_init_fn=seed_worker,
+                generator=self.g,
+            )
+
+        
 
         if dataset_name in CLASSIFICATION_DATASETS:
             mean_std_dataset = ConcatDataset(self.train_datasets)
@@ -1164,12 +1180,16 @@ class AttackTSInverseWorker(Worker):
                 exist_ok=True,
             )
 
+            # add a random seed so it does not overwrite existing files
+            random_seed = torch.randint(0, 10000, (1,)).item()
+
             output_path = os.path.join(
                 output_directory,
                 (
                     f"ett_reconstruction_"
                     f"run_{config['run_number']}_"
-                    f"batch_{batch_number}.pt"
+                    f"batch_{batch_number}_"
+                    f"seed_{random_seed}.pt"
                 ),
             )
 
@@ -1904,6 +1924,8 @@ class AttackTSInverseWorker(Worker):
                 generator=self.g,
             )
 
+            model_val_loader = self.val_dataloader
+
             optimizer = torch.optim.Adam(
                 model.parameters(),
                 lr=config.get("model_train_learning_rate", 1e-4),
@@ -1958,7 +1980,7 @@ class AttackTSInverseWorker(Worker):
                 return loss_function(outputs, targets)
 
             loader_state = {"it": iter(model_train_loader)}
-            debug_fl = config.get("debug_fl", True)
+            debug_fl = config.get("debug_fl", False)
 
             # Debug printouts are limit
             debug_rounds = 100 
@@ -2005,7 +2027,7 @@ class AttackTSInverseWorker(Worker):
 
 
                     # Optional: client-side defenses (the server only sees these)
-                    '''
+                    
                     if config.get("defense_name", "none") not in {None, "none"}:
                         if config.get("sign", False):
                             gradients = apply_sign_transformation(gradients)
@@ -2013,7 +2035,7 @@ class AttackTSInverseWorker(Worker):
                             gradients = apply_pruning(gradients, config["prune_rate"])
                         if config.get("dp_epsilon", 0) > 0:
                             gradients = add_gaussian_noise(gradients, config["dp_epsilon"])
-                    '''
+                    
 
                     client_gradients.append(gradients)
 
@@ -2066,10 +2088,52 @@ class AttackTSInverseWorker(Worker):
                     parameter.grad = gradient
                 optimizer.step()
 
+                # Validate the model after each round.
+                model.eval()
+                val_loss = 0.0
+                val_target_elements = 0
+                with torch.no_grad():
+                    for batch_x, batch_y, batch_x_mark, batch_y_mark in tqdm(model_val_loader, desc=f"Validating after round {epoch + 1}"):
+                        batch_x = batch_x.float().to(config["device"])
+                        batch_y = batch_y.float().to(config["device"])
+                        batch_x_mark = batch_x_mark.float().to(config["device"])
+                        batch_y_mark = batch_y_mark.float().to(config["device"])
+
+                        dec_inp = torch.cat(
+                            [
+                                batch_y[:, :label_len, :],
+                                torch.zeros_like(batch_y[:, -pred_len:, :]),
+                            ],
+                            dim=1,
+                        )
+
+                        outputs = model(
+                            batch_x,
+                            batch_x_mark,
+                            dec_inp,
+                            batch_y_mark,
+                        )
+                        if isinstance(outputs, tuple):
+                            outputs = outputs[0]
+
+                        outputs = outputs[:, -pred_len:, f_dim:]
+                        targets = batch_y[:, -pred_len:, f_dim:]
+
+                        loss = loss_function(outputs, targets)
+                        val_loss += loss.item() * targets.numel()
+                        val_target_elements += targets.numel()
+
                 print(
                     f"FL round {epoch + 1:02d}/{model_train_epochs} | "
-                    f"mean client MSE {np.mean(round_loss):.6f}"
+                    f"validation MSE {val_loss / val_target_elements:.6f}"
                 )
+
+                # print(
+                #     f"FL round {epoch + 1:02d}/{model_train_epochs} | "
+                #     f"mean client MSE {np.mean(round_loss):.6f}"
+                # )
+
+
             '''
             # Train the forecasting model.
             for epoch in range(model_train_epochs):
