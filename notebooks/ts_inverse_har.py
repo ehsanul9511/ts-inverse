@@ -198,7 +198,7 @@ global_config = {
     'experiment_name': 'ts-inverse_batch1_without_target_reconst_12-6-2024',
     # 'seed': [10, 43, 28, 80, 71], # 28, 80, 71],
     'seed': [43], # 28, 80, 71],
-    'batch_size': [1, 2, 4, 8, 16, 32, 64][:1],
+    'batch_size': [1, 2, 4, 8, 16, 32, 64][3:],
     'device': 'cuda',
     'verbose': True,
     'pool_size': 1,
@@ -222,12 +222,8 @@ global_config = {
     "model_train_learning_rate": 1e-3,
 
     "reconstruction_output_dir": (
-        "/scratch/ejk5818/ts-inverse/reconstructions/mobifall/"
+        "/scratch/ejk5818/ts-inverse/reconstructions/ett/"
     ),
-    # "defense_name": "none",
-    "defense_name": "dp",
-    # "prune_rate": [0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9][-4:],
-    "dp_epsilon": [0.001, 0.01, 0.1, 1.0][1:2],
 }
 
 attack_config = [
@@ -249,7 +245,7 @@ attack_config = [
         'timegan_gifd_lr_decay': 'on_plateau_10',
         'timegan_gifd_sign_gradients': False,
         # invert attack
-        'num_learn_epochs': 1,
+        'num_learn_epochs': 0,
         'learn_learning_rate': 1e-3, 
         'attack_batch_size': 32,
         'inversion_batch_size': 1, # global_config['batch_size'],
@@ -286,7 +282,7 @@ attack_config = [
 
         ## Optimization attack
         'gradient_loss': ['l1'], 
-        'base_num_attack_steps': 5000,
+        'base_num_attack_steps': 1000,
         # 'after_effect': 'clamp_2',
         "perturbation_space": ["dct"],
         "after_effect": "none",
@@ -305,6 +301,10 @@ attack_config = [
         'attack_number_of_batches': 1,
         "eval_ts2vec": True,
         "eval_catch22": True,
+        # "defense_name": "none",
+        "defense_name": "dp",
+        # "prune_rate": [0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9][-4:],
+        "dp_epsilon": [0.001, 0.01, 0.1, 1.0][1:2],
     },
 ]
 
