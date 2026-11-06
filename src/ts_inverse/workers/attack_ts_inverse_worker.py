@@ -1,7 +1,14 @@
 import os
+import json
+import time
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
 from copy import deepcopy
 from tqdm import tqdm
-from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_EXCEPTION
+from contextlib import nullcontext
+import threading
 import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.data import DataLoader, ConcatDataset, TensorDataset
 
@@ -331,32 +338,177 @@ class AttackTSInverseWorker(Worker):
                 "Increase number_of_batches."
             )
         
-        for batch_number in range(config["attack_number_of_batches"]):
-            model.load_state_dict(self.all_model_state_dicts[batch_number])
-            original_dy_dx = self.all_model_gradients[batch_number]
-            dummy_inputs = self.all_dummy_inputs[batch_number]
-            dummy_targets = self.all_dummy_targets[batch_number]
-            batch_inputs = self.all_batch_inputs[batch_number]
-            batch_targets = self.all_batch_targets[batch_number]
+        # Normalize strings such as "cuda" and "cuda:0", as well as torch.device objects.
+        is_cuda = torch.device(config["device"]).type == "cuda"
+        parallel = is_cuda and number_of_attacks > 1 and config.get("parallel_attacks", True)
+        self._attack_context = threading.local()
+        self._attack_logging_lock = threading.RLock()
+        self._attack_print_lock = threading.Lock()
+        self._inversion_setup_lock = threading.Lock()
+        self._attack_progress_lock = threading.Lock()
+        self._attack_stop = threading.Event()
+        self._attack_progress = {
+            batch: [0, "pending"] for batch in range(number_of_attacks)
+        }
+        self._parallel_attacks = parallel
+        self._attack_started_at = time.monotonic()
+        if config.get("dataset") in ETT_DATASETS:
+            self._reconstruction_run_dir = self._create_reconstruction_run(config)
 
-            self.attack_batch(
-                model, config, batch_number, original_dy_dx, dummy_inputs, dummy_targets, batch_inputs, batch_targets
-            )
+        def run_batch(batch_number):
+            self._attack_context.batch_number = batch_number
+            stream = None
+            try:
+                if parallel:
+                    # A stream and model per batch isolate weights, gradients,
+                    # buffers, dropout masks, and optimizer state.
+                    stream = torch.cuda.Stream(device=config["device"])
+                    stream.wait_stream(producer_stream)
+                with torch.cuda.stream(stream) if parallel else nullcontext():
+                    batch_model = deepcopy(model) if parallel else model
+                    batch_model.load_state_dict(self.all_model_state_dicts[batch_number])
+                    self._set_attack_progress(batch_number, status="preparing")
+                    self.attack_batch(
+                        batch_model, dict(config), batch_number,
+                        self.all_model_gradients[batch_number],
+                        self.all_dummy_inputs[batch_number],
+                        self.all_dummy_targets[batch_number],
+                        self.all_batch_inputs[batch_number],
+                        self.all_batch_targets[batch_number],
+                    )
+                    if stream is not None:
+                        stream.synchronize()
+                status = "cancelled" if self._attack_stop.is_set() else "completed"
+                self._set_attack_progress(batch_number, status=status)
+                if parallel and batch_number == number_of_attacks - 1:
+                    return batch_model.state_dict()
+            except BaseException:
+                self._set_attack_progress(batch_number, status="failed")
+                self._attack_stop.set()
+                raise
+            finally:
+                # Keep tensors/models alive until their stream has finished,
+                # including when an exception interrupts an attack.
+                if stream is not None:
+                    stream.synchronize()
+                del self._attack_context.batch_number
+
+        try:
+            if parallel:
+                producer_stream = torch.cuda.current_stream(config["device"])
+                print(f"Running {number_of_attacks} attack batches in parallel on {config['device']}", flush=True)
+                with ThreadPoolExecutor(max_workers=number_of_attacks) as executor:
+                    futures = [executor.submit(run_batch, batch) for batch in range(number_of_attacks)]
+                    pending = set(futures)
+                    while pending:
+                        done, pending = wait(pending, timeout=60, return_when=FIRST_EXCEPTION)
+                        for future in done:
+                            future.result()
+                        self._print_attack_progress(config)
+                # Preserve the sequential path's final model state.
+                model.load_state_dict(futures[-1].result())
+            else:
+                reason = (
+                    f"device {config['device']} is not CUDA"
+                    if not is_cuda
+                    else f"attack_number_of_batches={number_of_attacks}; parallel execution needs at least 2"
+                )
+                print(f"Running attack batches sequentially: {reason}", flush=True)
+                for batch_number in range(number_of_attacks):
+                    run_batch(batch_number)
+        finally:
+            self._parallel_attacks = False
 
         self.log_aggregate_reconstruction_metrics(config)
 
-        if config["device"] != "cpu":
+        if torch.device(config["device"]).type == "cuda":
             torch.cuda.empty_cache()
 
         model.eval()
 
-    def attack_batch(self, model, config, batch_number, original_dy_dx, dummy_inputs, dummy_targets, batch_inputs, batch_targets):
-        # Get the inversion model from super class.
-        # inversion_model = super().attack_batch(
-        #     model, config, batch_number, original_dy_dx, dummy_inputs, dummy_targets, batch_inputs, batch_targets
-        # )
+    def _set_attack_progress(self, batch_number, completed=None, status=None):
+        with self._attack_progress_lock:
+            progress = self._attack_progress[batch_number]
+            if completed is not None:
+                progress[0] = completed
+            if status is not None:
+                progress[1] = status
+
+    def _print_attack_progress(self, config):
+        # Preserve the inclusive attack loop: steps 0 through num_attack_steps.
+        total = config["num_attack_steps"] + 1 if config["num_attack_steps"] > 0 else 0
+        with self._attack_progress_lock:
+            overall_completed = sum(completed for completed, _ in self._attack_progress.values())
+            overall_total = total * len(self._attack_progress)
+            lines = [
+                f"[Batch {batch}] {completed}/{total} attack steps ({status})"
+                for batch, (completed, status) in self._attack_progress.items()
+            ]
+        elapsed_minutes = (time.monotonic() - self._attack_started_at) / 60
+        self._print_batch(
+            f"Attack progress — elapsed {elapsed_minutes:.1f} min | "
+            f"Overall: {overall_completed}/{overall_total} attack steps\n"
+            + "\n".join(lines)
+        )
+
+    def _create_reconstruction_run(self, config):
+        root = Path(config.get(
+            "reconstruction_output_dir",
+            Path(__file__).resolve().parents[3] / "reconstructions",
+        ))
+        timestamp = datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d_%H%M%S_%f%z")
+        output_directory = root / f"{config['dataset']}_{timestamp}"
+        output_directory.mkdir(parents=True, exist_ok=False)
+
+        def json_value(value):
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+            if isinstance(value, np.generic):
+                return value.item()
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().tolist()
+            if isinstance(value, (Path, torch.device)):
+                return str(value)
+            raise TypeError(f"Cannot serialize config value of type {type(value).__name__}")
+
+        with (output_directory / "config.json").open("w") as handle:
+            json.dump(config, handle, indent=2, default=json_value)
+            handle.write("\n")
+        self._print_batch("Saving run config and reconstructions to:", output_directory)
+        return output_directory
+
+    def _save_batch_reconstruction(self, config, batch_number, batch_inputs, dummy_inputs):
+        # start_attack creates the shared run directory before launching threads.
+        if not hasattr(self, "_reconstruction_run_dir"):
+            self._reconstruction_run_dir = self._create_reconstruction_run(config)
+        final_mapping = get_batch_sample_mapping(batch_inputs, dummy_inputs)
+        output_path = self._reconstruction_run_dir / f"batch_{batch_number}.pt"
+        torch.save(
+            {
+                "reconstructed_data": dummy_inputs[final_mapping].detach().cpu(),
+                "original_data": batch_inputs.detach().cpu(),
+            },
+            output_path,
+        )
+        self._print_batch("Saved reconstructed data and original data:", output_path)
+
+    def _print_batch(self, *args, **kwargs):
+        batch = getattr(getattr(self, "_attack_context", None), "batch_number", None)
+        prefix = f"[Batch {batch}]" if batch is not None else "[Attack]"
+        with getattr(self, "_attack_print_lock", nullcontext()):
+            kwargs.setdefault("flush", True)
+            print(prefix, *args, **kwargs)
+
+    def _log_metrics(self, metrics_dict, step):
+        batch = getattr(getattr(self, "_attack_context", None), "batch_number", None)
+        if batch is not None:
+            metrics_dict = {f"batch_{batch}/{key}": value for key, value in metrics_dict.items()}
+        with getattr(self, "_attack_logging_lock", nullcontext()):
+            super()._log_metrics(metrics_dict, step)
+
+    def _prepare_batch_inversion_model(self, model, config, batch_number, dummy_inputs, dummy_targets):
         if "num_learn_epochs" in config and config["num_learn_epochs"] <= 0:
-            print("Skipping inversion model training as num_learn_epochs <= 0")
+            self._print_batch("Skipping inversion model training as num_learn_epochs <= 0")
             inversion_model = None
         else:
             _, aux_gi_t_dataloader = create_gradient_inversion_dataloader(
@@ -366,10 +518,10 @@ class AttackTSInverseWorker(Worker):
                 self.auxiliary_val_dataloader, model, config, batch_number, dummy_inputs, dummy_targets
             )
 
-            print("Created gradient inversion dataloaders")
+            self._print_batch("Created gradient inversion dataloaders")
             inversion_model, _, _ = self.initialize_inversion_model(config, dummy_inputs, dummy_targets)
 
-            print("Initialized Inversion Model")
+            self._print_batch("Initialized Inversion Model")
             grad_to_input_optimizer, lr_schedular = self.set_attack_optimizer_and_schedular(
                 inversion_model.parameters(),
                 config["learn_optimizer"],
@@ -422,12 +574,16 @@ class AttackTSInverseWorker(Worker):
             # and victim model weights. For now, assume one fixed setup per dataset.
             model_path = generate_model_path(config, folder_path)
             if os.path.exists(model_path) and config["load_lti_model"]:
-                print(f"Loading inversion model from file: {model_path}")
+                self._print_batch(f"Loading inversion model from file: {model_path}")
                 inversion_model.load_state_dict(torch.load(model_path))
-                print(f"Loaded inversion model to file: {model_path}")
+                self._print_batch(f"Loaded inversion model from file: {model_path}")
             else:
 
-                for epoch in tqdm(range(config["num_learn_epochs"])):
+                for epoch in tqdm(
+                    range(config["num_learn_epochs"]),
+                    disable=getattr(self, "_parallel_attacks", False),
+                    desc=f"Batch {batch_number} inversion training",
+                ):
                     epoch_t_loss = self.inversion_model_epoch(
                         config, epoch, aux_gi_t_dataloader, inversion_model, grad_to_input_optimizer, lr_schedular
                     )
@@ -450,7 +606,22 @@ class AttackTSInverseWorker(Worker):
                     #     attack_metrics,
                     # )
                 torch.save(inversion_model.state_dict(), model_path)
-                print(f"Saved inversion model to file: {model_path}")
+                self._print_batch(f"Saved inversion model to file: {model_path}")
+
+        return inversion_model
+
+    def attack_batch(self, model, config, batch_number, original_dy_dx, dummy_inputs, dummy_targets, batch_inputs, batch_targets):
+        if not hasattr(self, "_attack_context"):
+            self._attack_context = threading.local()
+        self._attack_context.batch_number = batch_number
+        # Shared auxiliary loaders and checkpoint paths must be accessed serially.
+        # Only this setup phase is serialized; optimization runs on each stream.
+        with getattr(self, "_inversion_setup_lock", nullcontext()):
+            inversion_model = self._prepare_batch_inversion_model(
+                model, config, batch_number, dummy_inputs, dummy_targets
+            )
+            if getattr(self, "_parallel_attacks", False):
+                torch.cuda.current_stream(config["device"]).synchronize()
 
 
         if config["num_attack_steps"] == 0:
@@ -465,7 +636,7 @@ class AttackTSInverseWorker(Worker):
                 reconstructed_head_inputs = torch.mm(torch.pinverse(grad_b), grad_w)
                 dummy_targets = model.fc(reconstructed_head_inputs) - (grad_b.T / (2 / batch_targets.shape[1]))
                 dummy_targets.detach().clone()
-                print(dummy_inputs.shape, dummy_targets.shape)
+                self._print_batch(dummy_inputs.shape, dummy_targets.shape)
 
         if inversion_model is not None:
             inversion_model.eval()  # To be used for inference here
@@ -507,7 +678,7 @@ class AttackTSInverseWorker(Worker):
 
                 # dummy_inputs = regularization_inputs.clone().reshape(batch_inputs.size()).detach().requires_grad_(True)
                 # dummy_targets = regularization_targets.clone().reshape(batch_targets.size()).detach().requires_grad_(True)
-                # print(regularization_inputs.shape, regularization_targets.shape, batch_inputs.shape, batch_targets.shape)
+                # self._print_batch(regularization_inputs.shape, regularization_targets.shape, batch_inputs.shape, batch_targets.shape)
             else:
                 regularization_inputs, regularization_targets = inversion_model(flattened_original_dy_dx.unsqueeze(0))
                 regularization_inputs = regularization_inputs.view(batch_inputs.size()).detach()
@@ -560,9 +731,16 @@ class AttackTSInverseWorker(Worker):
 
         sample_mapping = np.arange(0, batch_inputs.shape[0])
         if config['dataset'] not in ETT_DATASETS:
-            plot_original_and_dummy_data(config, sample_mapping, dummy_inputs, dummy_targets, batch_inputs, batch_targets)
+            with getattr(self, "_attack_logging_lock", nullcontext()):
+                plot_original_and_dummy_data(config, sample_mapping, dummy_inputs, dummy_targets, batch_inputs, batch_targets)
 
-        for attack_step in tqdm(range(0, config["num_attack_steps"] + 1), disable=not config["verbose"]):
+        for attack_step in tqdm(
+            range(0, config["num_attack_steps"] + 1),
+            disable=not config["verbose"] or getattr(self, "_parallel_attacks", False),
+            desc=f"Batch {batch_number} attack",
+        ):
+            if getattr(self, "_attack_stop", None) is not None and self._attack_stop.is_set():
+                return
             attack_metrics = {
                 "step": attack_step + config["num_learn_epochs"],
                 "sample_mapping": sample_mapping,
@@ -654,11 +832,12 @@ class AttackTSInverseWorker(Worker):
                 )
 
                 if attack_step >= config["num_attack_steps"]:
-                    grad_dict, fig = self.plot_gradients(dummy_dy_dx, original_dy_dx, config)
-                    # attack_metrics.update(grad_dict)
-                    self._log_matplotlib_figure(
-                        fig, attack_step + config["num_learn_epochs"], log_name="gradients", matplotlib_only=True
-                    )
+                    with getattr(self, "_attack_logging_lock", nullcontext()):
+                        grad_dict, fig = self.plot_gradients(dummy_dy_dx, original_dy_dx, config)
+                        # attack_metrics.update(grad_dict)
+                        self._log_matplotlib_figure(
+                            fig, attack_step + config["num_learn_epochs"], log_name=f"gradients_batch_{batch_number}", matplotlib_only=True
+                        )
 
                 loss_components["gradient_matching"] = self.gradient_loss_function(
                     dummy_dy_dx,
@@ -906,8 +1085,13 @@ class AttackTSInverseWorker(Worker):
 
             self.schedular_step(config["attack_opti_lr_decay"], dummy_schedular, attack_metrics, dy_dx_loss)
 
+            if hasattr(self, "_attack_progress"):
+                # Scalar loss reads above wait for the optimizer's CUDA work.
+                self._set_attack_progress(batch_number, completed=attack_step + 1, status="running")
+
             # Should calcualte evalaution metrics and log them
-            if attack_step % (config["num_attack_steps"] // min(config["num_attack_steps"], 200)) == 0:
+            # but only if parallel is False, otherwise it will be done in the main thread after all batches are completed
+            if attack_step % (config["num_attack_steps"] // min(config["num_attack_steps"], 200)) == 0 and not getattr(self, "_parallel_attacks", False):
                 self.evaluate_and_log_reconstruction(
                     config,
                     batch_inputs,
@@ -931,55 +1115,7 @@ class AttackTSInverseWorker(Worker):
 
 
         if config["dataset"] in ETT_DATASETS:
-            # Match reconstructed samples to the order of the original batch.
-            final_mapping = get_batch_sample_mapping(
-                batch_inputs,
-                dummy_inputs,
-            )
-
-            reconstructed_data = (
-                dummy_inputs[final_mapping]
-                .detach()
-                .cpu()
-            )
-
-            output_directory = config.get(
-                "reconstruction_output_dir",
-                "reconstructions",
-            )
-
-            os.makedirs(
-                output_directory,
-                exist_ok=True,
-            )
-
-            # add a random seed so it does not overwrite existing files
-            random_seed = torch.randint(0, 10000, (1,)).item()
-
-            output_path = os.path.join(
-                output_directory,
-                (
-                    f"ett_reconstruction_"
-                    f"run_{config['run_number']}_"
-                    f"batch_{batch_number}_"
-                    f"seed_{random_seed}.pt"
-                ),
-            )
-
-            torch.save(
-                {
-                    "reconstructed_data": reconstructed_data,
-                    "original_data": batch_inputs.detach().cpu(),
-                },
-                output_path,
-            )
-
-            print(
-                "Saved reconstructed data and original data:",
-                output_path,
-            )
-
-            
+            self._save_batch_reconstruction(config, batch_number, batch_inputs, dummy_inputs)
 
     def learned_prior_regularization(self, dummy_inputs, dummy_targets, regularization_inputs, regularization_targets, config):
         learned_prior_regularization = torch.zeros(1, device=dummy_inputs.device)
@@ -1367,7 +1503,7 @@ class AttackTSInverseWorker(Worker):
             if batch_num != aux_grads.size(0):
                 continue
 
-            # print(batch_size, batch_num, aux_grads.shape, aux_inputs.shape, aux_targets.shape)
+            # self._print_batch(batch_size, batch_num, aux_grads.shape, aux_inputs.shape, aux_targets.shape)
             aux_grads, aux_inputs, aux_targets = aux_grads[:batch_num], aux_inputs[:batch_num], aux_targets[:batch_num]
             aux_grads = aux_grads.view(batch_size, config["batch_size"], aux_grads.shape[-1]).mean(
                 1
@@ -1390,12 +1526,12 @@ class AttackTSInverseWorker(Worker):
             if (
                 config['dataset'] not in ETT_DATASETS and (aux_inputs.min() < 0 or aux_inputs.max() > 1)
             ):
-                print("Aux inputs out of range:", aux_inputs.min(), aux_inputs.max())
+                self._print_batch("Aux inputs out of range:", aux_inputs.min(), aux_inputs.max())
 
             if (
                 config['dataset'] not in ETT_DATASETS and (aux_targets.min() < 0 or aux_targets.max() > 1)
             ):
-                print("Aux targets out of range:", aux_targets.min(), aux_targets.max())
+                self._print_batch("Aux targets out of range:", aux_targets.min(), aux_targets.max())
 
             predicted_inputs, predicted_targets = inversion_model(aux_grads)
 
@@ -1410,14 +1546,13 @@ class AttackTSInverseWorker(Worker):
             epoch_loss.append(loss.detach().item())
             if config["verbose"]:
                 if grad_to_input_optimizer is None:
-                    print(f'\rEpoch {epoch}/{config["num_attack_steps"]}: Val Loss: {round(np.mean(epoch_loss), 5)}', end="")
+                    self._print_batch(f'Epoch {epoch}/{config["num_learn_epochs"]}: Val Loss: {round(np.mean(epoch_loss), 5)}')
                 else:
-                    print(
-                        f'\rEpoch {epoch}/{config["num_attack_steps"]}: Train Loss: {round(np.mean(epoch_loss), 5)} lr: {lr_schedular.get_last_lr()}',
-                        end="",
+                    self._print_batch(
+                        f'Epoch {epoch}/{config["num_learn_epochs"]}: Train Loss: {round(np.mean(epoch_loss), 5)} lr: {lr_schedular.get_last_lr()}',
                     )
         if config["verbose"]:
-            print()
+            self._print_batch()
 
         return epoch_loss
 
@@ -2318,7 +2453,17 @@ class AttackTSInverseWorker(Worker):
             aggregate_metrics,
         )
 
-    def evaluate_and_log_reconstruction(
+    def evaluate_and_log_reconstruction(self, *args, **kwargs):
+        with getattr(self, "_attack_logging_lock", nullcontext()):
+            try:
+                return self._evaluate_and_log_reconstruction(*args, **kwargs)
+            finally:
+                if getattr(self, "_parallel_attacks", False):
+                    # The shared evaluator may cache tensors created on this
+                    # batch's stream; make them ready before another uses it.
+                    torch.cuda.current_stream().synchronize()
+
+    def _evaluate_and_log_reconstruction(
         self,
         config,
         batch_inputs,
@@ -2442,7 +2587,7 @@ class AttackTSInverseWorker(Worker):
             self._log_metrics(attack_metrics, step=attack_step + attack_step_offset)
 
             if config["verbose"]:
-                print(f"Attack Step {attack_step + attack_step_offset}: {attack_metrics}")
+                self._print_batch(f"Attack Step {attack_step + attack_step_offset}: {attack_metrics}")
 
     def plot_gradients(self, dummy_dy_dx, original_dy_dx, config):
         """Plot all gradients along the x-axis as bars. The goal is to show the values"""
@@ -2888,12 +3033,12 @@ def create_gradient_inversion_dataloader(
 
     # Check if the dataset file exists and load file
     if os.path.exists(dataset_path):
-        print("Loaded gradient to inputs targets dataset:", dataset_path)
+        print(f"[Batch {batch_number}] Loaded gradient to inputs targets dataset:", dataset_path)
         grad_inputs_targets_dataset = torch.load(dataset_path, weights_only=False)
         config["loaded_grad_to_inputs_targets_dataset_from_file"] = True
     else:
         # If the file does not exist, proceed with creating the dataset
-        print("Creating gradient to inputs targets dataset:", dataset_path)
+        print(f"[Batch {batch_number}] Creating gradient to inputs targets dataset:", dataset_path)
         config["loaded_grad_to_inputs_targets_dataset_from_file"] = False
         aux_dy_dx_inputs, aux_inputs_targets, aux_targets_targets = [], [], []
         for i, batch in enumerate(aux_dataloader):

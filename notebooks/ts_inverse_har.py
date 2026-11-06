@@ -81,7 +81,7 @@ global_config = {
     'experiment_name': 'ts-inverse_batch1_without_target_reconst_12-6-2024',
     # 'seed': [10, 43, 28, 80, 71], # 28, 80, 71],
     'seed': [43], # 28, 80, 71],
-    'batch_size': [1, 2, 4, 8, 16, 32, 64][4:5],
+    'batch_size': [1, 2, 4, 8, 16, 32, 64, 128][6:],
     'device': 'cuda',
     'verbose': True,
     'pool_size': 1,
@@ -90,7 +90,7 @@ global_config = {
     'total_variation_beta_targets': 0,
     'after_effect': 'none',
     'warmup_number_of_batches': 0,
-    'number_of_batches': 1,
+    'number_of_batches': 8,
     'update_model': False, # Update the model in generating gradients from training data
     'model_evaluation_during_attack': False, # Baselines do not consider this
     'load_lti_model': True,
@@ -105,7 +105,7 @@ global_config = {
     "model_train_learning_rate": 1e-3,
 
     "reconstruction_output_dir": (
-        "/scratch/ejk5818/ts-inverse/reconstructions/ett/"
+        "/scratch/ejk5818/ts-inverse/reconstructions/"
     ),
 }
 
@@ -181,13 +181,13 @@ attack_config = [
         'grad_signs_for_targets': False,
         'grad_signs_for_dropouts': True, #[False, True],
 
-        'attack_number_of_batches': 1,
+        'attack_number_of_batches': global_config['number_of_batches'],
         "eval_ts2vec": True,
         "eval_catch22": True,
-        # "defense_name": "none",
-        "defense_name": "dp",
+        "defense_name": "none",
+        # "defense_name": "dp",
         # "prune_rate": [0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9][-4:],
-        "dp_epsilon": [0.001, 0.01, 0.1, 1.0][1:2],
+        # "dp_epsilon": [0.001, 0.01, 0.1, 1.0][1:2],
     },
 ]
 

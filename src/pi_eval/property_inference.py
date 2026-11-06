@@ -103,10 +103,9 @@ def sample_validation_batches(args, shape):
     return batches, len(candidates)
 
 
-def baseline_table(x, y, batches, thresholds, duration, conditions):
-    lines = ['### Comparison with random validation batches', '',
-             '| Channel / condition | Threshold | Original % | Recon % | Random % (mean ± SD) | Recon error (pp) | Random error (mean ± SD, pp) | Error reduction % |',
-             '|---|---:|---:|---:|---:|---:|---:|---:|']
+def baseline_results(x, y, batches, thresholds, duration, conditions):
+    """Return unrounded property metrics, including gains (None for zero baseline error)."""
+    rows = []
     for label, channels, k in conditions:
         paired = np.asarray(comparison(x, y, thresholds, duration, channels, k))
         original, reconstructed = paired[:, 0], paired[:, 1]
@@ -118,13 +117,35 @@ def baseline_table(x, y, batches, thresholds, duration, conditions):
         for j, threshold in enumerate(thresholds):
             attack_error = abs(original[j] - reconstructed[j])
             baseline_error = errors[:, j].mean()
-            gain = (f'{100 * (1 - attack_error / baseline_error):.2f}'
-                    if baseline_error > 0 else 'N/A')
-            lines.append(f'| {label} | {threshold:g} | {original[j]:.2f} | '
-                         f'{reconstructed[j]:.2f} | '
-                         f'{random_values[:, j].mean():.2f} ± {random_values[:, j].std(ddof=1):.2f} | '
-                         f'{attack_error:.2f} | {baseline_error:.2f} ± {errors[:, j].std(ddof=1):.2f} | {gain} |')
+            rows.append(dict(
+                condition=label, threshold=threshold,
+                original=original[j], reconstructed=reconstructed[j],
+                random_mean=random_values[:, j].mean(),
+                random_std=random_values[:, j].std(ddof=1),
+                attack_error=attack_error, baseline_error=baseline_error,
+                baseline_std=errors[:, j].std(ddof=1),
+                error_reduction=(100 * (1 - attack_error / baseline_error)
+                                 if baseline_error > 0 else None),
+            ))
+    return rows
+
+
+def format_baseline_table(rows):
+    lines = ['### Comparison with random validation batches', '',
+             '| Channel / condition | Threshold | Original % | Recon % | Random % (mean ± SD) | Recon error (pp) | Random error (mean ± SD, pp) | Error reduction % |',
+             '|---|---:|---:|---:|---:|---:|---:|---:|']
+    for row in rows:
+        gain = f"{row['error_reduction']:.2f}" if row['error_reduction'] is not None else 'N/A'
+        lines.append(
+            f"| {row['condition']} | {row['threshold']:g} | {row['original']:.2f} | "
+            f"{row['reconstructed']:.2f} | {row['random_mean']:.2f} ± {row['random_std']:.2f} | "
+            f"{row['attack_error']:.2f} | {row['baseline_error']:.2f} ± {row['baseline_std']:.2f} | {gain} |"
+        )
     return '\n'.join(lines)
+
+
+def baseline_table(x, y, batches, thresholds, duration, conditions):
+    return format_baseline_table(baseline_results(x, y, batches, thresholds, duration, conditions))
 
 
 def main():
