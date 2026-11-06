@@ -46,7 +46,8 @@ CLASSIFICATION_DATASETS = {
     "motionsense",
 }
 
-ETT_DATASETS = ["ETTh1", "ETTh2", "ETTm1", "ETTm2"]
+ETT_DATASETS = ["ETTh1", "ETTh2", "ETTm1", "ETTm2",
+                "ILI", "electricity"]
 
 FEATURE_NAMES = [
     "acc_x", "acc_y", "acc_z",
@@ -3039,10 +3040,13 @@ def get_feature_names(config, num_features):
     if config["dataset"] in ETT_DATASETS:
         if config.get("features", "M") == "S":
             names = [config.get("target", "OT")]
-        else:
+        elif str(config["dataset"]).startswith("ETT"):
             names = ETT_FEATURE_NAMES
+        else:
+            names = [] 
     else:
         names = FEATURE_NAMES
+        
     return [
         names[i] if i < len(names) else f"feature_{i}"
         for i in range(num_features)
