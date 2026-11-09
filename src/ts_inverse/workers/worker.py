@@ -76,7 +76,8 @@ class Worker:
     def _update_config(self, config):
         if "wandb" in self.logger_object_dict.keys():
             run_config = wandb.run.config
-            run_config.update(config)
+            # Preparation resolves optional settings (e.g. None -> candidate count).
+            run_config.update(config, allow_val_change=True)
 
     def _log_dataframe(self, df, step, log_name=""):
         if "wandb" in self.logger_object_dict.keys():

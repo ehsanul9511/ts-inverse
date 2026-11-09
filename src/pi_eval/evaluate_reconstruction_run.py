@@ -4,14 +4,17 @@
 Examples (from the repository root):
   python src/pi_eval/evaluate_reconstruction_run.py reconstructions/ETTh1_<timestamp>
   python src/pi_eval/evaluate_reconstruction_run.py
+  python src/pi_eval/evaluate_reconstruction_run.py all
 
 With no folder argument, select the latest timestamped folder in reconstructions/.
+With 'all', evaluate every immediate subfolder and write one report per folder.
 The validation baseline uses the dataset and preprocessing in that folder's config.json.
 Use --root-path to relocate the ETT CSV directory without changing preprocessing.
 """
 import argparse
 from datetime import datetime
 import json
+import pickle
 from pathlib import Path
 import re
 import sys
@@ -103,7 +106,8 @@ def baseline_settings(config, args, channel_count):
     )
 
 
-def evaluate_run(folder, args):
+def evaluate_run(folder, args, wandb_run=None):
+    """Build the report and optionally log combined metrics to an existing W&B run."""
     import torch
     with (folder / 'config.json').open(encoding='utf-8') as handle:
         config = json.load(handle)
@@ -162,16 +166,33 @@ def evaluate_run(folder, args):
         '## Combined performance by property', '',
         'Each row averages the same condition, threshold, and duration across batches. '
         'All batches have equal weight.', '',
-        '| Duration | Channel / condition | Threshold | Mean original % | Mean recon % | Mean random % | Mean recon error (pp) | Mean random error (pp) | Mean error reduction % | Batches with defined reduction |',
-        '|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|',
+        f'Error lists follow batch order: {[index for index, _ in files]}. '
+        'Each random error is that batch\'s mean absolute error across validation draws. '
+        'All errors and differences are in percentage points.', '',
+        '| Duration | Channel | Threshold | Mean reconstruction error | Mean random error | Mean reconstruction error - Mean random error | List of all reconstruction errors | List of all random errors |',
+        '|---:|---|---:|---:|---:|---:|---|---|',
     ]
+    wandb_metrics = {}
     for (duration, condition, threshold), rows in combined_rows.items():
-        means = [np.mean([row[field] for row in rows]) for field in
-                 ('original', 'reconstructed', 'random_mean', 'attack_error', 'baseline_error')]
-        gains = [row['error_reduction'] for row in rows if row['error_reduction'] is not None]
-        gain = f'{np.mean(gains):.2f}' if gains else 'N/A'
-        cells = ' | '.join(f'{mean:.2f}' for mean in means)
-        summary.append(f'| {duration} | {condition} | {threshold:g} | {cells} | {gain} | {len(gains)}/{len(rows)} |')
+        reconstruction_errors = [row['attack_error'] for row in rows]
+        random_errors = [row['baseline_error'] for row in rows]
+        mean_reconstruction = np.mean(reconstruction_errors)
+        mean_random = np.mean(random_errors)
+        difference = mean_reconstruction - mean_random
+        reconstruction_list = '[' + ', '.join(f'{value:.2f}' for value in reconstruction_errors) + ']'
+        random_list = '[' + ', '.join(f'{value:.2f}' for value in random_errors) + ']'
+        summary.append(
+            f'| {duration} | {condition} | {threshold:g} | {mean_reconstruction:.2f} | '
+            f'{mean_random:.2f} | {difference:.2f} | {reconstruction_list} | {random_list} |'
+        )
+        prefix = f'{condition}/{threshold:g}/{duration}'
+        wandb_metrics.update({
+            f'{prefix}/Mean reconstruction error': float(mean_reconstruction),
+            f'{prefix}/Mean random error': float(mean_random),
+            f'{prefix}/Mean reconstruction error - Mean random error': float(difference),
+            f'{prefix}/List of all reconstruction errors': [float(value) for value in reconstruction_errors],
+            f'{prefix}/List of all random errors': [float(value) for value in random_errors],
+        })
     evaluation_config = dict(vars(settings), thresholds=args.thresholds, durations=args.durations,
                              channel_names=names, conditions=[label for label, _, _ in conditions])
     warnings = []
@@ -194,12 +215,12 @@ def evaluate_run(folder, args):
         'Error reduction = 100 × (1 − reconstruction error / mean random validation error). '
         'Errors are absolute differences of batch-level property percentages, in percentage points. '
         'Negative reduction means reconstruction is worse than the random baseline.',
-        'Combined rows preserve each condition, threshold, and duration separately. Each numeric column '
-        'is an unweighted average across batches, using unrounded values (not weighted by window count). '
-        'Mean error reduction is the average of the individual batches\' error-reduction percentages for '
-        'that exact row, not a ratio of the averaged errors. Zero baseline error gives N/A; it is excluded '
-        'only from that row\'s error-reduction average. The contributing batch count is shown for every row. '
-        'Other columns include all batches. The separate 2-of-3 coincidence table remains descriptive, '
+        'Combined rows preserve each condition, threshold, and duration separately. Mean reconstruction '
+        'error and mean random error are unweighted averages across all batches, using unrounded values '
+        '(not weighted by window count). Their difference is reconstruction minus random error: negative '
+        'means reconstruction is better than the random baseline. Zero errors are included in means and '
+        'lists. In the per-batch tables, error reduction is N/A when random error is zero. '
+        'The separate 2-of-3 coincidence table remains descriptive, '
         'matching the standalone script.',
         'Thresholds are strictly greater-than comparisons in saved tensor units. Durations are timesteps. '
         'Fractions are computed per window and averaged; runs never cross window boundaries. '
@@ -216,12 +237,21 @@ def evaluate_run(folder, args):
         '```json\n' + json.dumps(evaluation_config, indent=2, default=str) + '\n```',
         *details,
     ]
+    if wandb_run is not None:
+        # One history entry per folder; let W&B assign the next step after the
+        # attack logs. Lists retain numeric batch order and full precision.
+        wandb_run.log({
+            **wandb_metrics,
+            'property_inference/run_folder': str(folder.resolve()),
+            'property_inference/batch_indices': [index for index, _ in files],
+        })
     return '\n\n'.join(report) + '\n'
 
 
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('folder', nargs='?', type=Path, help='Run folder; defaults to the latest timestamped run')
+    parser.add_argument('folder', nargs='?', type=Path,
+                        help="Run folder, or 'all' for every subfolder; defaults to the latest timestamped run")
     parser.add_argument('--reconstructions-dir', type=Path, default=REPO_ROOT / 'reconstructions')
     parser.add_argument('--output-dir', type=Path, default=REPO_ROOT / 'evaluation_results')
     parser.add_argument('--root-path', type=Path, help='Override the ETT CSV directory saved in config.json')
@@ -235,7 +265,7 @@ def make_parser():
     return parser
 
 
-def main(argv=None):
+def main(argv=None, wandb_run=None):
     parser = make_parser()
     args = parser.parse_args(argv)
     if args.baseline_draws < 10 or args.baseline_stride < 1:
@@ -244,16 +274,37 @@ def main(argv=None):
         parser.error('Thresholds must be finite')
     if any(duration < 1 for duration in args.durations):
         parser.error('Durations must be positive')
+    all_runs = args.folder == Path('all')
     try:
-        folder = args.folder.resolve() if args.folder else latest_run(args.reconstructions_dir)
-        report = evaluate_run(folder, args)
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        output = args.output_dir / f'{folder.name}_property_inference.md'
-        output.write_text(report, encoding='utf-8')
-    except (OSError, ValueError, KeyError) as error:
+        if all_runs:
+            if not args.reconstructions_dir.is_dir():
+                raise ValueError(f'Reconstructions directory does not exist: {args.reconstructions_dir}')
+            folders = sorted(p.resolve() for p in args.reconstructions_dir.iterdir() if p.is_dir())
+            if not folders:
+                raise ValueError(f'No reconstruction folders found in {args.reconstructions_dir}')
+        else:
+            folders = [args.folder.resolve() if args.folder else latest_run(args.reconstructions_dir)]
+    except (OSError, ValueError) as error:
         parser.error(str(error))
-    print(f'Saved evaluation report: {output}')
-    return output
+    outputs, failures = [], []
+    for folder in folders:
+        print(f'Evaluating run: {folder}', flush=True)
+        try:
+            report = evaluate_run(folder, args, wandb_run=wandb_run)
+            args.output_dir.mkdir(parents=True, exist_ok=True)
+            output = args.output_dir / f'{folder.name}_property_inference.md'
+            output.write_text(report, encoding='utf-8')
+        except (OSError, ValueError, KeyError, RuntimeError, EOFError, pickle.UnpicklingError) as error:
+            if not all_runs:
+                parser.error(str(error))
+            failures.append(folder.name)
+            print(f'Failed to evaluate {folder}: {error}', file=sys.stderr, flush=True)
+            continue
+        outputs.append(output)
+        print(f'Saved evaluation report: {output}')
+    if failures:
+        parser.exit(1, f'Generated {len(outputs)} reports; failed folders: {", ".join(failures)}\n')
+    return outputs if all_runs else outputs[0]
 
 
 if __name__ == '__main__':

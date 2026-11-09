@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import time
 from datetime import datetime
 from pathlib import Path
@@ -10,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_EXCEPTION
 from contextlib import nullcontext
 import threading
 import torch.optim.lr_scheduler as lr_scheduler
-from torch.utils.data import DataLoader, ConcatDataset, TensorDataset
+from torch.utils.data import DataLoader, ConcatDataset, TensorDataset, Subset
 
 
 from matplotlib import pyplot as plt
@@ -232,12 +233,6 @@ class AttackTSInverseWorker(Worker):
                 f"Batch input shape: {self.all_batch_inputs[0].shape}, "
                 f"Batch target shape: {self.all_batch_targets[0].shape}"
             )
-            print(
-                f"Model state dict keys: {list(self.all_model_state_dicts[0].keys())}"
-            )
-            print(
-                f"Model gradient shapes: {[g.shape for g in self.all_model_gradients[0]]}"
-            )
 
 
         number_of_attacks = config["attack_number_of_batches"]
@@ -426,6 +421,19 @@ class AttackTSInverseWorker(Worker):
 
         model.eval()
 
+        # All batch workers have finished saving; evaluate this run explicitly.
+        if config.get("dataset") in ETT_DATASETS and any(self._reconstruction_run_dir.glob("batch_*.pt")):
+            from pi_eval.evaluate_reconstruction_run import main as evaluate_reconstruction_run
+
+            wandb_run = None
+            if "wandb" in getattr(self, "logger_object_dict", {}):
+                import wandb
+
+                wandb_run = wandb.run
+            evaluate_reconstruction_run(
+                [str(self._reconstruction_run_dir.resolve())], wandb_run=wandb_run
+            )
+
     def _set_attack_progress(self, batch_number, completed=None, status=None):
         with self._attack_progress_lock:
             progress = self._attack_progress[batch_number]
@@ -474,6 +482,22 @@ class AttackTSInverseWorker(Worker):
         with (output_directory / "config.json").open("w") as handle:
             json.dump(config, handle, indent=2, default=json_value)
             handle.write("\n")
+        if config.get("attack_batch_sampling") == "property_percentiles":
+            distribution = config["attack_sampling_percentiles"]
+            selected = [row for row in config["attack_sampling_selected_batches"] if row["attacked"]]
+            fig, ax = plt.subplots(figsize=(8, 4))
+            try:
+                ax.plot([row["percentile"] for row in distribution],
+                        [row["property_score"] for row in distribution], label="Candidate score percentiles")
+                ax.scatter([row["rank_percentile"] for row in selected],
+                           [row["property_score"] for row in selected], color="tab:red", label="Selected attack batches")
+                ax.set(xlabel="Percentile", ylabel="Mean elevated fraction",
+                       title=f"Attack batch selection: {config['attack_sampling_target_channel']}")
+                ax.legend()
+                fig.tight_layout()
+                fig.savefig(output_directory / "attack_sampling_percentiles.png")
+            finally:
+                plt.close(fig)
         self._print_batch("Saving run config and reconstructions to:", output_directory)
         return output_directory
 
@@ -1666,8 +1690,438 @@ class AttackTSInverseWorker(Worker):
 
         return all_dummy_inputs, all_dummy_targets
 
+    def load_or_train_poisoned_global_model(self, model, config):
+        """Prepare a forecasting model with target-channel property-aware training.
+
+        First load poison_base_checkpoint_path (a clean state_dict or a dictionary
+        with model_state_dict), or warm up on unmodified auxiliary forecasts for
+        poison_pretrain_epochs (default: model_train_epochs if positive, otherwise
+        poison_train_epochs). Then optimize forecast MSE + poison_property_weight
+        * property MSE. Only the forecasting model is returned and checkpointed.
+
+        Property: fraction of input timesteps in runs strictly exceeding
+        poison_property_threshold (default 0.5, in preprocessed units), lasting at
+        least poison_property_duration steps (default 1). The temporary sigmoid
+        head predicts a fraction in [0, 1] from the encoder representation.
+        poison_property_weight defaults to 1.0; poison_property_hidden_size to 64.
+        poison_representation_layer defaults to 'encoder'; pooling defaults to
+        'target_token' for iTransformer and 'mean' for other models, configurable
+        via poison_representation_pool. The encoder must output [batch, tokens, D].
+
+        This is a representation-learning intervention, not a measured guarantee
+        of increased gradient leakage. Client losses and reconstruction stay intact.
+        """
+        if config["dataset"] not in ETT_DATASETS:
+            raise ValueError("Poisoned global-model training currently supports ETT datasets only.")
+        if config.get("aux_dataset") is not None:
+            raise ValueError(
+                "Poison training uses the ETT held-out splits; custom aux_dataset is not supported. "
+                "Set poison_auxiliary_split to 'test' or 'val'."
+            )
+        dataset = self.train_datasets[0]
+        mode = dataset.features  # config['features'] can contain model feature indices.
+        source = Path(dataset.root_path) / dataset.data_path
+        channels = ([dataset.target] if mode == "S" else list(pd.read_csv(source, nrows=0).columns[1:]))
+        requested = config.get("poison_target_channel")
+        if isinstance(requested, str) and requested in channels:
+            channel_index = channels.index(requested)
+        elif type(requested) is int and 0 <= requested < len(channels):
+            channel_index = requested
+        else:
+            raise ValueError(f"poison_target_channel must be a channel name in {channels} or its zero-based index.")
+        split = config.get("poison_auxiliary_split", "test")
+        if split not in {"test", "val"}:
+            raise ValueError("poison_auxiliary_split must be 'test' or 'val'.")
+        epochs = config.get("poison_train_epochs", 10)
+        batch_size = config.get("poison_train_batch_size", config.get("model_train_batch_size", 32))
+        learning_rate = config.get("poison_train_learning_rate", config.get("model_train_learning_rate", 1e-4))
+        seed = config.get("poison_seed", config["seed"])
+        if type(epochs) is not int or epochs < 1 or type(batch_size) is not int or batch_size < 1:
+            raise ValueError("poison_train_epochs and poison_train_batch_size must be positive integers.")
+        if not np.isfinite(learning_rate) or learning_rate <= 0:
+            raise ValueError("poison_train_learning_rate must be positive and finite.")
+        if mode not in {"M", "MS", "S"}:
+            raise ValueError(f"Unsupported ETT feature mode {mode!r}.")
+        auxiliary_sets = self.test_datasets if split == "test" else self.val_datasets
+        # Discard the loader's lookback prefix so auxiliary windows stay entirely
+        # in the requested held-out split (especially important for validation).
+        auxiliary = ConcatDataset([
+            Subset(part, range(part.seq_len, len(part))) for part in auxiliary_sets
+        ])
+        if len(auxiliary) == 0:
+            raise ValueError("No auxiliary windows remain after excluding split lookback rows.")
+        if any((part.features, part.seq_len, part.label_len, part.pred_len) !=
+               (mode, dataset.seq_len, dataset.label_len, dataset.pred_len) for part in auxiliary_sets):
+            raise ValueError("Auxiliary ETT preprocessing must match the benign training dataset.")
+
+        property_weight = config.get("poison_property_weight", 1.0)
+        threshold = config.get("poison_property_threshold", 0.5)
+        duration = config.get("poison_property_duration", 1)
+        hidden_size = config.get("poison_property_hidden_size", 64)
+        base_path = config.get("poison_base_checkpoint_path")
+        base_path = Path(base_path) if base_path else None
+        pretrain_epochs = config.get(
+            "poison_pretrain_epochs",
+            0 if base_path else (config.get("model_train_epochs", 0) or epochs),
+        )
+        if not np.isfinite(property_weight) or property_weight < 0:
+            raise ValueError("poison_property_weight must be finite and nonnegative (0 is a forecast-only control).")
+        if not np.isfinite(threshold):
+            raise ValueError("poison_property_threshold must be finite.")
+        if type(duration) is not int or not 1 <= duration <= dataset.seq_len:
+            raise ValueError("poison_property_duration must be between 1 and seq_len.")
+        if type(hidden_size) is not int or hidden_size < 1:
+            raise ValueError("poison_property_hidden_size must be a positive integer.")
+        if type(pretrain_epochs) is not int or pretrain_epochs < 0 or (base_path is None and pretrain_epochs == 0):
+            raise ValueError("Use positive poison_pretrain_epochs or supply a clean poison_base_checkpoint_path.")
+        layer_name = config.get("poison_representation_layer", "encoder")
+        representation_layer = dict(model.named_modules()).get(layer_name)
+        if representation_layer is None or not layer_name:
+            raise ValueError(f"Model has no internal representation layer {layer_name!r}.")
+        pooling = config.get("poison_representation_pool", "target_token" if model.name == "iTransformer" else "mean")
+        if pooling not in {"mean", "target_token"}:
+            raise ValueError("poison_representation_pool must be 'mean' or 'target_token'.")
+        base_identity = None
+        if base_path is not None:
+            base_identity = {"path": str(base_path.resolve()), "size": base_path.stat().st_size,
+                             "mtime_ns": base_path.stat().st_mtime_ns}
+
+        metadata = {
+            "method": "property_multitask_elevated_fraction_v1",
+            "base_checkpoint": base_identity, "pretrain_epochs": pretrain_epochs,
+            "property_weight": property_weight, "property_threshold": threshold,
+            "property_duration": duration, "property_hidden_size": hidden_size,
+            "representation_layer": layer_name, "representation_pool": pooling,
+            "dataset": config["dataset"], "source_csv": str(source.resolve()),
+            "source_size": source.stat().st_size, "source_mtime_ns": source.stat().st_mtime_ns,
+            "model_class": f"{type(model).__module__}.{type(model).__qualname__}",
+            "model_architecture": repr(model),
+            "channels": channels, "channel_index": channel_index,
+            "features": mode, "target": dataset.target, "scale": dataset.scale,
+            "timeenc": dataset.timeenc, "freq": dataset.freq,
+            "seq_len": dataset.seq_len, "label_len": dataset.label_len, "pred_len": dataset.pred_len,
+            "auxiliary_split": split, "auxiliary_windows": len(auxiliary),
+            "epochs": epochs, "batch_size": batch_size, "learning_rate": learning_rate,
+            "seed": seed, "initialization_seed": config["seed"],
+        }
+        digest = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()[:16]
+        checkpoint_path = Path(config.get("poison_checkpoint_path") or (
+            Path(__file__).resolve().parents[3] / "models" / "poisoned_global"
+            / f"{config['dataset']}_{channels[channel_index]}_{digest}.pt"
+        ))
+        config.update({
+            "poison_checkpoint_path": str(checkpoint_path.resolve()),
+            "poison_target_channel_name": channels[channel_index],
+            "poison_target_channel_index": channel_index,
+            "poison_auxiliary_split": split,
+            "poison_train_epochs": epochs, "poison_train_batch_size": batch_size,
+            "poison_train_learning_rate": learning_rate, "poison_seed": seed,
+            "poison_method": metadata["method"],
+            "poison_pretrain_epochs": pretrain_epochs,
+            "poison_base_checkpoint_path": str(base_path.resolve()) if base_path else None,
+            "poison_property_weight": property_weight, "poison_property_threshold": threshold,
+            "poison_property_duration": duration, "poison_property_hidden_size": hidden_size,
+            "poison_representation_layer": layer_name, "poison_representation_pool": pooling,
+        })
+        model.to(config["device"])
+        if checkpoint_path.is_file() and not config.get("poison_force_retrain", False):
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            if checkpoint.get("poisoning") != metadata:
+                raise ValueError(
+                    f"Poison checkpoint metadata does not match this experiment: {checkpoint_path}. "
+                    "Use a different path or set poison_force_retrain=True."
+                )
+            model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+            model.zero_grad(set_to_none=True)
+            model.eval()
+            config["poison_model_source"] = "checkpoint"
+            print(f"[Poison] Loaded channel {channels[channel_index]} model from {checkpoint_path}")
+            return model
+
+        loader = DataLoader(
+            auxiliary, batch_size=batch_size, shuffle=True,
+            generator=torch.Generator().manual_seed(seed), worker_init_fn=seed_worker,
+        )
+        device = torch.device(config["device"])
+        cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+
+        def forecast_batch(batch):
+            batch_x, batch_y, x_mark, y_mark = (t.float().to(device) for t in batch)
+            if batch_x.shape[-1] != len(channels) or batch_y.shape[-1] != len(channels):
+                raise ValueError("Auxiliary channel count does not match the ETT CSV.")
+            # The client forecasting inputs, decoder history and labels are unmodified.
+            decoder = torch.cat([
+                batch_y[:, :dataset.label_len],
+                torch.zeros_like(batch_y[:, -dataset.pred_len:]),
+            ], dim=1)
+            outputs = model(batch_x, x_mark, decoder, y_mark)
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]
+            f_dim = -1 if mode == "MS" else 0
+            outputs = outputs[:, -dataset.pred_len:, f_dim:]
+            targets = batch_y[:, -dataset.pred_len:, f_dim:]
+            if outputs.shape != targets.shape:
+                raise ValueError(f"Poison forecast shape {outputs.shape} differs from targets {targets.shape}.")
+            return batch_x, F.mse_loss(outputs, targets), targets.numel()
+
+        def property_labels(batch_x):
+            with torch.no_grad():
+                elevated = batch_x[..., channel_index] > threshold
+                if duration > 1:
+                    # Mark every timestep belonging to a qualifying sustained run.
+                    # Overlapping qualifying windows count each timestep only once.
+                    runs = elevated.unfold(1, duration, 1).all(dim=-1)
+                    kernel = batch_x.new_ones(1, 1, duration)
+                    elevated = F.conv_transpose1d(runs.to(batch_x.dtype).unsqueeze(1), kernel).squeeze(1) > 0
+                return elevated.to(batch_x.dtype).mean(dim=1, keepdim=True)
+
+        # Preserve the benign sampler and defense RNG, including head initialization.
+        with torch.random.fork_rng(devices=cuda_devices):
+            torch.random.default_generator.manual_seed(seed)
+            if device.type == "cuda":
+                with torch.cuda.device(device):
+                    torch.cuda.manual_seed(seed)
+            if base_path is not None:
+                base = torch.load(base_path, map_location="cpu", weights_only=True)
+                if "poisoning" in base:
+                    raise ValueError("poison_base_checkpoint_path must be a clean forecasting checkpoint.")
+                model.load_state_dict(base.get("model_state_dict", base), strict=True)
+                print(f"[Poison] Loaded clean forecasting model from {base_path}")
+
+            optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=learning_rate)
+            model.train()
+            for epoch in range(pretrain_epochs):
+                squared_error, elements = 0.0, 0
+                for batch in loader:
+                    optimizer.zero_grad(set_to_none=True)
+                    _, loss, count = forecast_batch(batch)
+                    if not torch.isfinite(loss):
+                        raise RuntimeError("Non-finite loss during clean forecasting warm-up.")
+                    loss.backward()
+                    optimizer.step()
+                    squared_error += loss.item() * count
+                    elements += count
+                print(f"[Poison] Forecast warm-up {epoch + 1}/{pretrain_epochs} "
+                      f"| auxiliary forecast MSE {squared_error / elements:.6f}")
+
+            representation = []
+
+            def capture_representation(module, inputs, output):
+                value = output[0] if isinstance(output, (tuple, list)) else output
+                if not isinstance(value, torch.Tensor) or value.ndim != 3:
+                    raise ValueError("Property representation must have shape [batch, tokens, hidden].")
+                # Do not detach: the property loss must update the forecasting encoder.
+                representation[:] = [value]
+
+            handle = representation_layer.register_forward_hook(capture_representation)
+            property_head = None  # Kept local, never registered on the forecasting model.
+            optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=learning_rate)
+            try:
+                for epoch in range(epochs):
+                    forecast_sum, forecast_elements, property_sum, windows_seen = 0.0, 0, 0.0, 0
+                    label_sum, label_squared_sum = 0.0, 0.0
+                    for batch in loader:
+                        optimizer.zero_grad(set_to_none=True)
+                        representation.clear()
+                        batch_x, forecast_loss, count = forecast_batch(batch)
+                        if not representation:
+                            raise ValueError(f"Representation layer {layer_name!r} was not called during forecasting.")
+                        hidden = representation.pop()
+                        if hidden.shape[0] != batch_x.shape[0]:
+                            raise ValueError("Property representation batch size does not match the inputs.")
+                        if not hidden.requires_grad and property_weight > 0:
+                            raise ValueError("Property representation is detached or frozen; it cannot train the encoder.")
+                        if pooling == "target_token":
+                            if hidden.shape[1] <= channel_index:
+                                raise ValueError("Target channel token is missing from the encoder representation.")
+                            hidden = hidden[:, channel_index, :]
+                        else:
+                            hidden = hidden.mean(dim=1)
+                        if property_head is None:
+                            property_head = nn.Sequential(
+                                nn.Linear(hidden.shape[-1], hidden_size), nn.ReLU(),
+                                nn.Linear(hidden_size, 1), nn.Sigmoid(),
+                            ).to(device=device, dtype=hidden.dtype)
+                            optimizer.add_param_group({"params": property_head.parameters()})
+                        labels = property_labels(batch_x)
+                        property_loss = F.mse_loss(property_head(hidden), labels)
+                        loss = forecast_loss + property_weight * property_loss
+                        if not torch.isfinite(loss):
+                            raise RuntimeError("Non-finite loss during property-aware poison training.")
+                        loss.backward()
+                        optimizer.step()
+                        forecast_sum += forecast_loss.item() * count
+                        forecast_elements += count
+                        property_sum += property_loss.item() * len(batch_x)
+                        windows_seen += len(batch_x)
+                        label_sum += labels.sum().item()
+                        label_squared_sum += labels.square().sum().item()
+                    label_variance = max(0.0, label_squared_sum / windows_seen - (label_sum / windows_seen) ** 2)
+                    print(f"[Poison] Channel {channels[channel_index]} epoch {epoch + 1}/{epochs} "
+                          f"| forecast MSE {forecast_sum / forecast_elements:.6f} "
+                          f"| property MSE {property_sum / windows_seen:.6f} "
+                          f"| property label std {label_variance ** 0.5:.6f} | weight {property_weight:g}")
+            finally:
+                handle.remove()
+                representation.clear()
+                # No property head, hooks, or optimizer state enters the checkpoint
+                # or changes the parameter ordering used for client gradients.
+                del property_head, optimizer
+
+        model.zero_grad(set_to_none=True)
+        model.eval()
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "model_state_dict": {name: value.detach().cpu() for name, value in model.state_dict().items()},
+            "poisoning": metadata,
+        }, checkpoint_path)
+        config["poison_model_source"] = "trained"
+        print(f"[Poison] Saved channel {channels[channel_index]} model to {checkpoint_path}")
+        return model
+
+    def _property_percentile_attack_loader(self, tr_dataloader, config):
+        """Select full candidate batches by their mean target-channel property.
+
+        Candidates are a seeded random partition of the benign training windows.
+        Only indices and scores are retained, then selected batches are replayed
+        with their original inputs, forecast labels, and timestamps.
+        """
+        dataset = self.train_datasets[0]
+        channels = ([dataset.target] if dataset.features == "S" else list(
+            pd.read_csv(Path(dataset.root_path) / dataset.data_path, nrows=0).columns[1:]
+        ))
+        requested = config.get("attack_sampling_target_channel", config.get("poison_target_channel"))
+        if isinstance(requested, str) and requested in channels:
+            channel = channels.index(requested)
+        elif type(requested) is int and 0 <= requested < len(channels):
+            channel = requested
+        else:
+            raise ValueError(f"attack_sampling_target_channel must be a name in {channels} or a zero-based index.")
+        threshold = config.get("attack_sampling_threshold", config.get("poison_property_threshold", 0.5))
+        duration = config.get("attack_sampling_duration", config.get("poison_property_duration", 1))
+        seed = config.get("attack_sampling_seed", config["seed"])
+        if not np.isfinite(threshold):
+            raise ValueError("attack_sampling_threshold must be finite.")
+        if type(duration) is not int or not 1 <= duration <= dataset.seq_len:
+            raise ValueError("attack_sampling_duration must be between 1 and seq_len.")
+        batch_size = tr_dataloader.batch_size
+        if type(batch_size) is not int or batch_size < 1:
+            raise ValueError("Property sampling requires a DataLoader with a fixed batch_size.")
+        record_count = config["number_of_batches"]
+        attack_count = config.get("attack_number_of_batches", record_count)
+        if (type(record_count) is not int or type(attack_count) is not int
+                or not 1 <= attack_count <= record_count):
+            raise ValueError("Property sampling requires 1 <= attack_number_of_batches <= number_of_batches.")
+        available = len(tr_dataloader.dataset) // batch_size
+        candidate_count = config.get("attack_sampling_candidate_batches")
+        if candidate_count is None:
+            candidate_count = available
+        elif type(candidate_count) is not int or candidate_count < 1:
+            raise ValueError("attack_sampling_candidate_batches must be a positive integer or None.")
+        candidate_count = min(candidate_count, available)
+        if candidate_count < record_count:
+            raise ValueError(
+                f"Property sampling has {candidate_count} full candidate batches, but needs {record_count}. "
+                "Increase attack_sampling_candidate_batches or reduce number_of_batches/batch_size."
+            )
+        generator = torch.Generator().manual_seed(seed)
+        permutation = torch.randperm(len(tr_dataloader.dataset), generator=generator)
+        candidates = permutation[:candidate_count * batch_size].reshape(candidate_count, batch_size).tolist()
+        loader = DataLoader(
+            tr_dataloader.dataset, batch_sampler=candidates,
+            collate_fn=tr_dataloader.collate_fn,
+            generator=torch.Generator().manual_seed(seed),
+        )
+        print(f"[Attack sampling] Scoring {candidate_count}/{available} full candidate batches "
+              f"of {batch_size} windows | seed={seed} | channel={channels[channel]} "
+              f"| threshold>{threshold:g} | minimum duration={duration}", flush=True)
+        print(f"[Attack sampling] Property is the mean per-window elevated fraction in input windows; "
+              f"units are preprocessed. Excluding {len(tr_dataloader.dataset) % batch_size} remainder windows.", flush=True)
+        scores = []
+        report_every = max(1, candidate_count // 10)
+        with torch.no_grad():
+            for index, batch in enumerate(loader):
+                inputs = batch[0]
+                if inputs.ndim != 3 or inputs.shape[-1] != len(channels):
+                    raise ValueError("Candidate input shape does not match the dataset channels.")
+                values = inputs[..., channel]
+                if not torch.isfinite(values).all():
+                    raise ValueError(f"Candidate batch {index} has non-finite target-channel values.")
+                elevated = values > threshold
+                if duration > 1:
+                    qualifying = elevated.unfold(1, duration, 1).all(dim=-1)
+                    elevated = F.conv_transpose1d(
+                        qualifying.float().unsqueeze(1),
+                        torch.ones(1, 1, duration, device=values.device),
+                    ).squeeze(1) > 0
+                score = elevated.double().mean(dim=1).mean().item()
+                scores.append(score)
+                if (index + 1) % report_every == 0 or index + 1 == candidate_count:
+                    print(f"[Attack sampling] Scored {index + 1}/{candidate_count} batches "
+                          f"| latest score={score:.6f} | range so far=[{min(scores):.6f}, {max(scores):.6f}]", flush=True)
+        scores = np.asarray(scores)
+        order = np.argsort(scores, kind="stable")
+        percentiles = np.arange(0, 101, 10)
+        percentile_scores = np.percentile(scores, percentiles)
+        print(f"[Attack sampling] Score distribution: min={scores.min():.6f}, max={scores.max():.6f}, "
+              f"mean={scores.mean():.6f}, std={scores.std():.6f}, unique={len(np.unique(scores))}", flush=True)
+        print("[Attack sampling] Percentile | property score | fraction chart (0 to 1)", flush=True)
+        for percentile, score in zip(percentiles, percentile_scores):
+            print(f"[Attack sampling] P{percentile:03d} | {score:.6f} | {'#' * int(round(score * 40))}", flush=True)
+        if scores.min() == scores.max():
+            print("[Attack sampling] WARNING: all candidate scores are identical; percentile selection "
+                  "cannot add property variation. Consider another threshold/duration or candidate pool.", flush=True)
+
+        def spread_indices(size, count):
+            return np.rint(np.linspace(0, size - 1, count)).astype(int) if count > 1 else np.array([(size - 1) // 2])
+
+        # The first attack_count entries are the batches actually attacked by
+        # start_attack. Spread those across the FULL pool even if extra batches
+        # were requested just for gradient recording.
+        attack_ranks = spread_indices(candidate_count, attack_count).tolist()
+        ranks = list(attack_ranks)
+        if record_count > attack_count:
+            chosen_ranks = set(attack_ranks)
+            remaining = [rank for rank in range(candidate_count) if rank not in chosen_ranks]
+            ranks += [remaining[i] for i in spread_indices(len(remaining), record_count - attack_count)]
+        selected = []
+        print(f"[Attack sampling] Selected {attack_count} attack batches in ascending score order "
+              f"and {record_count - attack_count} additional recording batches. Rank percentiles may share tied scores.", flush=True)
+        for batch_number, rank in enumerate(ranks):
+            candidate = int(order[rank])
+            rank_percentile = 100 * rank / (candidate_count - 1) if candidate_count > 1 else 50.0
+            entry = {
+                "batch_index": batch_number, "candidate_index": candidate,
+                "rank_percentile": rank_percentile, "property_score": float(scores[candidate]),
+                "window_indices": candidates[candidate], "attacked": batch_number < attack_count,
+            }
+            selected.append(entry)
+            print(f"[Attack sampling] Batch {batch_number} ({'attack' if entry['attacked'] else 'record only'}) "
+                  f"<- candidate {candidate} | rank P{rank_percentile:.2f} | score={scores[candidate]:.6f} "
+                  f"| window indices={candidates[candidate]}", flush=True)
+        config.update({
+            "attack_sampling_target_channel": channels[channel], "attack_sampling_threshold": threshold,
+            "attack_sampling_duration": duration, "attack_sampling_seed": seed,
+            "attack_sampling_candidate_batches": candidate_count,
+            "attack_sampling_percentiles": [
+                {"percentile": int(p), "property_score": float(v)} for p, v in zip(percentiles, percentile_scores)
+            ],
+            "attack_sampling_selected_batches": selected,
+        })
+        return DataLoader(
+            tr_dataloader.dataset, batch_sampler=[entry["window_indices"] for entry in selected],
+            collate_fn=tr_dataloader.collate_fn, generator=torch.Generator().manual_seed(seed),
+        )
+
     def train_model_and_record(self, model, tr_dataloader, config):
         dataset = config["dataset"]
+        sampling = config.get("attack_batch_sampling", "random")
+        if sampling not in {"random", "property_percentiles"}:
+            raise ValueError("attack_batch_sampling must be 'random' or 'property_percentiles'.")
+        if sampling == "property_percentiles" and dataset not in ETT_DATASETS:
+            raise ValueError("Property-percentile attack sampling currently supports ETT datasets only.")
+        if config.get("poison_global_model", False) and dataset not in ETT_DATASETS:
+            raise ValueError("Poisoned global-model training currently supports ETT datasets only.")
         model.to(config["device"])
         all_batch_inputs, all_batch_targets, all_model_state_dicts, all_model_gradients, all_model_updates = [], [], [], [], []
         if dataset in ETT_DATASETS:
@@ -1688,6 +2142,12 @@ class AttackTSInverseWorker(Worker):
                     f"but the ETT dataloader contains "
                     f"{len(tr_dataloader)} batches."
                 )
+
+            if config.get("poison_global_model", False):
+                self.load_or_train_poisoned_global_model(model, config)
+                # Begin benign gradient collection from this poisoned state;
+                # clean FL training here would undo the experimental intervention.
+                model_train_epochs = 0
 
             model_train_loader = DataLoader(
                 tr_dataloader.dataset,
@@ -1968,7 +2428,11 @@ class AttackTSInverseWorker(Worker):
             self.all_batch_input_marks = []
             self.all_batch_target_marks = []
 
-            for batch_number, batch in enumerate(tr_dataloader):
+            attack_loader = (
+                self._property_percentile_attack_loader(tr_dataloader, config)
+                if sampling == "property_percentiles" else tr_dataloader
+            )
+            for batch_number, batch in enumerate(attack_loader):
                 if batch_number >= number_of_batches:
                     break
 

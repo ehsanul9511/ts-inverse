@@ -76,12 +76,12 @@ def start_multi_process(g_config, a_config, d_config, m_config, pool_size):
 
 
 global_config = {
-    # 'logger_service': 'wandb',
-    'logger_service': 'none',
+    'logger_service': 'wandb',
+    # 'logger_service': 'none',
     'experiment_name': 'ts-inverse_batch1_without_target_reconst_12-6-2024',
     # 'seed': [10, 43, 28, 80, 71], # 28, 80, 71],
     'seed': [43], # 28, 80, 71],
-    'batch_size': [1, 2, 4, 8, 16, 32, 64, 128][6:],
+    'batch_size': [1, 2, 4, 8, 16, 32, 64, 128][3:4],
     'device': 'cuda',
     'verbose': True,
     'pool_size': 1,
@@ -91,6 +91,12 @@ global_config = {
     'after_effect': 'none',
     'warmup_number_of_batches': 0,
     'number_of_batches': 8,
+    # Use "property_percentiles" to attack batches spanning the property scores.
+    'attack_batch_sampling': 'property_percentiles',
+    'attack_sampling_target_channel': 'HUFL',
+    'attack_sampling_threshold': 0.5,
+    'attack_sampling_duration': 1,
+    'attack_sampling_candidate_batches': None,  # Score all available full batches.
     'update_model': False, # Update the model in generating gradients from training data
     'model_evaluation_during_attack': False, # Baselines do not consider this
     'load_lti_model': True,
@@ -103,6 +109,15 @@ global_config = {
     "model_train_epochs": 0,
     "model_train_batch_size": 64,
     "model_train_learning_rate": 1e-3,
+
+    # Opt in to a poisoned starting model before collecting benign gradients.
+    "poison_global_model": [True],
+    "poison_target_channel": "HUFL",  # CSV channel name or zero-based input index.
+    "poison_auxiliary_split": "test",  # "test" or "val"; benign data stays intact.
+    "poison_pretrain_epochs": 10,
+    "poison_property_weight": 1.0,
+    "poison_property_threshold": 0.5,
+    "poison_property_duration": 1,
 
     "reconstruction_output_dir": (
         "/scratch/ejk5818/ts-inverse/reconstructions/"
@@ -165,7 +180,7 @@ attack_config = [
 
         ## Optimization attack
         'gradient_loss': ['l1'], 
-        'base_num_attack_steps': 1000,
+        'base_num_attack_steps': 500,
         # 'after_effect': 'clamp_2',
         "perturbation_space": ["dct"],
         "after_effect": "none",
@@ -185,9 +200,14 @@ attack_config = [
         "eval_ts2vec": True,
         "eval_catch22": True,
         "defense_name": "none",
-        # "defense_name": "dp",
+        "defense_name": "dp",
         # "prune_rate": [0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9][-4:],
-        # "dp_epsilon": [0.001, 0.01, 0.1, 1.0][1:2],
+        "dp_epsilon": [0.001, 0.01, 0.1, 1.0][1:2],
+
+        "poison_pretrain_epochs": 10,
+        "poison_property_weight": 1.0,
+        "poison_property_threshold": 0.5,
+        "poison_property_duration": 1,
     },
 ]
 
