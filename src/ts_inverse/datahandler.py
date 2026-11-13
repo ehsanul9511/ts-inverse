@@ -688,8 +688,7 @@ ETT_DATASET_CLASSES = {
     "ETTh2": Dataset_ETT_hour,
     "ETTm1": Dataset_ETT_minute,
     "ETTm2": Dataset_ETT_minute,
-    "ILI": Dataset_Custom,
-    "electricity": Dataset_Custom,
+    "weather": Dataset_Custom,
 }
  
 def get_ett_dataset(
@@ -784,9 +783,17 @@ def get_ett_client_datasets(
     custom = dataset_class is Dataset_Custom
 
     frame, scaler = load_ett_dataframe(
-        root_path=root_path, data_path=data_path, flag="train",
-        seq_len=seq_len, features=features, target=target, scale=scale,
-        timeenc=timeenc, freq=freq, minute_level=minute_level,
+        root_path=root_path,
+        data_path=data_path,
+        flag="train",
+        seq_len=seq_len,
+        features=features,
+        target=target,
+        scale=scale,
+        timeenc=timeenc,
+        freq=freq,
+        minute_level=minute_level,
+        custom=custom,  # added: without this, weather gets ETT borders
     )
     client_frames = split_dataframe_equally(frame, num_clients)
 

@@ -47,7 +47,7 @@ CLASSIFICATION_DATASETS = {
 }
 
 ETT_DATASETS = ["ETTh1", "ETTh2", "ETTm1", "ETTm2",
-                "ILI", "electricity"]
+                "weather"]
 
 FEATURE_NAMES = [
     "acc_x", "acc_y", "acc_z",
@@ -3037,16 +3037,26 @@ def plot_channel_grid_original_vs_reconstructed(config, sample_mapping, dummy_in
     return df, fig
 
 def get_feature_names(config, num_features):
-    if config["dataset"] in ETT_DATASETS:
+    if config["dataset"] == "weather":
+        cols = [
+            c for c in pd.read_csv(
+                os.path.join(config["root_path"], config["data_path"]),
+                nrows=0,
+            ).columns
+            if c != "date"
+        ]
+        target = config.get("target", "OT")
+        names = [c for c in cols if c != target] + [target]  # matches Dataset_Custom ordering
+    elif config["dataset"] in ETT_DATASETS:
         if config.get("features", "M") == "S":
             names = [config.get("target", "OT")]
         elif str(config["dataset"]).startswith("ETT"):
             names = ETT_FEATURE_NAMES
         else:
-            names = [] 
+            names = []
     else:
         names = FEATURE_NAMES
-        
+
     return [
         names[i] if i < len(names) else f"feature_{i}"
         for i in range(num_features)
