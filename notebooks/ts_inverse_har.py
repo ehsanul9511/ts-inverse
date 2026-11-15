@@ -81,7 +81,7 @@ global_config = {
     'experiment_name': 'ts-inverse_batch1_without_target_reconst_12-6-2024',
     # 'seed': [10, 43, 28, 80, 71], # 28, 80, 71],
     'seed': [43], # 28, 80, 71],
-    'batch_size': [1, 2, 4, 8, 16, 32, 64, 128][3:4],
+    'batch_size': [1, 2, 4, 8, 16, 32, 64, 128][6:7],
     'device': 'cuda',
     'verbose': True,
     'pool_size': 1,
@@ -110,14 +110,30 @@ global_config = {
     "model_train_batch_size": 64,
     "model_train_learning_rate": 1e-3,
 
-    # Opt in to a poisoned starting model before collecting benign gradients.
+    # Train/check a weights-only gradient measurement on auxiliary data first.
     "poison_global_model": [True],
     "poison_target_channel": "HUFL",  # CSV channel name or zero-based input index.
     "poison_auxiliary_split": "test",  # "test" or "val"; benign data stays intact.
-    "poison_pretrain_epochs": 10,
-    "poison_property_weight": 1.0,
+    "poison_feasibility_only": False,  # Stop after held-out validation; no inversion.
+    "update_model": False,
+    "poison_feature_epochs": 10,
+    "poison_train_epochs": 10,
+    "poison_measurement_C": 10.0,
+    "poison_hidden_coordinate": 0,
+    "poison_holdout_fraction": 0.2,
+    "poison_validation_batch_sizes": [[1, 8, 32]],  # Inner list is one grid-search setting.
+    "poison_validation_batches": 8,  # Separate held-out gradients per batch size.
+    "poison_property_units": "standardized",
     "poison_property_threshold": 0.5,
     "poison_property_duration": 1,
+
+    "poison_strategy": "fixed_projection",
+    "poison_target_channel": "HUFL",
+    "poison_gradient_coordinates": [[
+        {"channel": "HUFL", "hidden_coordinate": j}
+        for j in [0, 8, 16, 24]
+    ]],
+    "poison_ensemble_loss_weight": 0.5,
 
     "reconstruction_output_dir": (
         "/scratch/ejk5818/ts-inverse/reconstructions/"
@@ -127,6 +143,7 @@ global_config = {
 attack_config = [
     {
         'attack_method': 'TS-Inverse',
+        "attack_mode": "both",
         # Opt-in, two-stage generative attack. The original direct-input
         # optimization remains unchanged when this flag is False.
         'timegan_gifd_enabled': True,
@@ -200,14 +217,10 @@ attack_config = [
         "eval_ts2vec": True,
         "eval_catch22": True,
         "defense_name": "none",
-        "defense_name": "dp",
+        # "defense_name": "dp",
         # "prune_rate": [0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9][-4:],
-        "dp_epsilon": [0.001, 0.01, 0.1, 1.0][1:2],
+        # "dp_epsilon": [0.001, 0.01, 0.1, 1.0][1:2],
 
-        "poison_pretrain_epochs": 10,
-        "poison_property_weight": 1.0,
-        "poison_property_threshold": 0.5,
-        "poison_property_duration": 1,
     },
 ]
 

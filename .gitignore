@@ -32,5 +32,8 @@ ideal_household_scripts/*
 models/*
 evaluation_results/*
 
-docs/*
-tests/*
+# docs/*
+# tests/*
+# !docs/poisoned_global_model.md
+# !tests/test_poisoned_global_model.py
+# !tests/test_client_property_inference.py

@@ -207,7 +207,18 @@ class AttackTSInverseWorker(Worker):
     def worker_process(self, c, d_c, m_c, fam_c, def_c):
         model, train_dataloader, final_config = self._init_attack_worker_process(c, d_c, m_c, fam_c, def_c)
         print("Initialized attack worker process")
+        self._uses_direct_property_inference(final_config)
         self.init_logger_object(final_config)
+        if final_config.get("poison_feasibility_only", False):
+            try:
+                if not final_config.get("poison_global_model", False):
+                    raise ValueError("poison_feasibility_only requires poison_global_model=True.")
+                self.load_or_train_poisoned_global_model(model, final_config)
+                self._update_config(final_config)
+                print("[Poison] Auxiliary feasibility check complete; skipping client attack and reconstruction.")
+            finally:
+                self._end_logger_object()
+            return
         self.init_attack(model, train_dataloader, final_config)
         self.start_attack(model, config=final_config)
         self._end_logger_object()
@@ -220,6 +231,7 @@ class AttackTSInverseWorker(Worker):
         return self._init_logger_object(project_names, tags, config)
 
     def init_attack(self, model, tr_dataloader, config):
+        direct = self._uses_direct_property_inference(config)
         # super().init_attack(model, tr_dataloader, config)
         self.all_batch_inputs, self.all_batch_targets, self.all_model_state_dicts, self.all_model_gradients, _ = (
             self.train_model_and_record(model, tr_dataloader, config)
@@ -246,6 +258,12 @@ class AttackTSInverseWorker(Worker):
 
         self.all_dummy_inputs = []
         self.all_dummy_targets = []
+
+        if direct and config.get("attack_mode") != "both":
+            self.all_dummy_inputs = [None] * number_of_attacks
+            self.all_dummy_targets = [None] * number_of_attacks
+            self._update_config(config)
+            return
 
         for batch_number in range(number_of_attacks):
             single_batch_config = dict(config)
@@ -323,6 +341,9 @@ class AttackTSInverseWorker(Worker):
             print("Length of dataloader:", len(self.aux_gi_t_dataloader))
 
     def start_attack(self, model, config):
+        direct = self._uses_direct_property_inference(config)
+        if direct:
+            self._property_inference_rows = {}
         number_of_attacks = config["attack_number_of_batches"]
         number_of_recorded_batches = len(self.all_model_state_dicts)
 
@@ -347,7 +368,7 @@ class AttackTSInverseWorker(Worker):
         }
         self._parallel_attacks = parallel
         self._attack_started_at = time.monotonic()
-        if config.get("dataset") in ETT_DATASETS:
+        if config.get("dataset") in ETT_DATASETS and (not direct or config.get("attack_mode") == "both"):
             self._reconstruction_run_dir = self._create_reconstruction_run(config)
 
         def run_batch(batch_number):
@@ -363,7 +384,7 @@ class AttackTSInverseWorker(Worker):
                     batch_model = deepcopy(model) if parallel else model
                     batch_model.load_state_dict(self.all_model_state_dicts[batch_number])
                     self._set_attack_progress(batch_number, status="preparing")
-                    self.attack_batch(
+                    result = self.attack_batch(
                         batch_model, dict(config), batch_number,
                         self.all_model_gradients[batch_number],
                         self.all_dummy_inputs[batch_number],
@@ -371,6 +392,11 @@ class AttackTSInverseWorker(Worker):
                         self.all_batch_inputs[batch_number],
                         self.all_batch_targets[batch_number],
                     )
+                    if direct:
+                        with self._attack_logging_lock:
+                            self._property_inference_rows[batch_number] = result
+                        if config.get("attack_mode") != "both":
+                            self._set_attack_progress(batch_number, completed=1)
                     if stream is not None:
                         stream.synchronize()
                 status = "cancelled" if self._attack_stop.is_set() else "completed"
@@ -414,6 +440,11 @@ class AttackTSInverseWorker(Worker):
         finally:
             self._parallel_attacks = False
 
+        if direct:
+            self._save_client_property_inference_report(config)
+            if config.get("attack_mode") != "both":
+                model.eval()
+                return
         self.log_aggregate_reconstruction_metrics(config)
 
         if torch.device(config["device"]).type == "cuda":
@@ -444,18 +475,21 @@ class AttackTSInverseWorker(Worker):
 
     def _print_attack_progress(self, config):
         # Preserve the inclusive attack loop: steps 0 through num_attack_steps.
-        total = config["num_attack_steps"] + 1 if config["num_attack_steps"] > 0 else 0
+        direct = self._uses_direct_property_inference(config) and config.get("attack_mode") != "both"
+        unit = "property measurements" if direct else "attack steps"
+        total = (1 if direct else
+                 config["num_attack_steps"] + 1 if config["num_attack_steps"] > 0 else 0)
         with self._attack_progress_lock:
             overall_completed = sum(completed for completed, _ in self._attack_progress.values())
             overall_total = total * len(self._attack_progress)
             lines = [
-                f"[Batch {batch}] {completed}/{total} attack steps ({status})"
+                f"[Batch {batch}] {completed}/{total} {unit} ({status})"
                 for batch, (completed, status) in self._attack_progress.items()
             ]
         elapsed_minutes = (time.monotonic() - self._attack_started_at) / 60
         self._print_batch(
             f"Attack progress — elapsed {elapsed_minutes:.1f} min | "
-            f"Overall: {overall_completed}/{overall_total} attack steps\n"
+            f"Overall: {overall_completed}/{overall_total} {unit}\n"
             + "\n".join(lines)
         )
 
@@ -634,7 +668,234 @@ class AttackTSInverseWorker(Worker):
 
         return inversion_model
 
+    @staticmethod
+    def _uses_direct_property_inference(config):
+        mode = config.get("attack_mode", "gradient_inversion")
+        if mode not in {"gradient_inversion", "poisoning_assisted_property_inference", "both"}:
+            raise ValueError("attack_mode must be gradient_inversion, poisoning_assisted_property_inference, or both.")
+        direct = mode in {"poisoning_assisted_property_inference", "both"}
+        if mode == "both" and config.get("num_attack_steps", 0) <= 0:
+            raise ValueError("attack_mode=both requires num_attack_steps > 0 to generate a reconstruction.")
+        if direct:
+            if not config.get("poison_global_model", False) or config.get("dataset") not in ETT_DATASETS:
+                raise ValueError("Direct property inference requires poison_global_model=True and an ETT dataset.")
+            if config.get("poison_feasibility_only", False):
+                raise ValueError("Set poison_feasibility_only=False to evaluate recorded client gradients.")
+            if config.get("update_model", False) or config.get("defense_name", "none") not in {None, "none"}:
+                raise ValueError("Direct property inference currently requires update_model=False and defense_name='none'.")
+        return direct
+
     def attack_batch(self, model, config, batch_number, original_dy_dx, dummy_inputs, dummy_targets, batch_inputs, batch_targets):
+        if self._uses_direct_property_inference(config):
+            row = self.poisoning_assisted_property_inference(
+                model, config, batch_number, original_dy_dx, batch_inputs, batch_targets)
+            if config.get("attack_mode") == "both":
+                reconstruction = self.gradient_inversion_attack(
+                    model, config, batch_number, original_dy_dx, dummy_inputs, dummy_targets, batch_inputs, batch_targets)
+                if reconstruction is None:
+                    raise RuntimeError(f"No completed reconstruction for comparison in batch {batch_number}.")
+                from pi_eval.property_inference import run_fractions
+                design = self.poison_feasibility_results["design"]
+                values = reconstruction.detach()[..., design["property_channel"]]
+                if design["threshold_units"] == "physical" and design["scale"]:
+                    c = design["property_channel"]
+                    values = values * design["scaler_scale"][c] + design["scaler_mean"][c]
+                if not torch.isfinite(values).all():
+                    raise ValueError("Non-finite reconstruction property inputs.")
+                scores = run_fractions((values > design["threshold"]).cpu().numpy(), design["duration"])
+                reconstructed_property = float(scores.mean())
+                row.update({"reconstruction_estimate": reconstructed_property,
+                            "reconstruction_per_window_property": scores.tolist(),
+                            "reconstruction_signed_error": reconstructed_property - row["true_property"],
+                            "reconstruction_absolute_error": abs(reconstructed_property - row["true_property"])})
+            return row
+        return self.gradient_inversion_attack(
+            model, config, batch_number, original_dy_dx, dummy_inputs, dummy_targets, batch_inputs, batch_targets)
+
+    def poisoning_assisted_property_inference(self, model, config, batch_number, original_dy_dx, batch_inputs, batch_targets):
+        """Decode recorded client gradients; client data is used only for evaluation/identity checks."""
+        from pi_eval.property_inference import run_fractions
+
+        if not self._uses_direct_property_inference(config):
+            raise ValueError("Select attack_mode='poisoning_assisted_property_inference'.")
+        preparation = getattr(self, "poison_feasibility_results", None)
+        if preparation is None or config.get("poison_method") != preparation["design"]["method"]:
+            raise ValueError("Missing matching poisoned-model preparation metadata; prepare the poisoned model first.")
+        design = preparation["design"]
+        strategy = design.get("strategy", "constant_bias")
+        if strategy not in {"constant_bias", "fixed_projection"}:
+            raise ValueError(f"Unsupported poison strategy {strategy!r}.")
+        if config.get("poison_strategy", strategy) != strategy:
+            raise ValueError("Poison strategy differs from the prepared model.")
+        coordinates = design.get("coordinates", [design.get("coordinate")])
+        names = [name for name, p in model.named_parameters() if p.requires_grad]
+        name = design["weight_name"]
+        if names != design["parameter_names"] or len(original_dy_dx) != len(names):
+            raise ValueError("Recorded gradient ordering does not match poisoned-model parameters.")
+        gradient = original_dy_dx[names.index(name)]
+        weight = dict(model.named_parameters())[name]
+        if gradient is None or gradient.shape != weight.shape or not torch.isfinite(gradient).all():
+            raise ValueError(f"Missing, incompatible or non-finite recorded gradient for {name}.")
+        K = 1 if design["features"] == "MS" else len(design["channels"])
+        # The attack observation is only these recorded scalars. No client data,
+        # recomputed gradient or ground-truth label enters this decoding step.
+        scalars = np.array([gradient[k, j].item() for k, j in coordinates])
+        if strategy == "constant_bias":
+            individual = K * scalars / (2 * design["C"])
+        else:
+            individual = (scalars - design["beta"]) / design["alpha"]
+        estimate = float(individual.mean())
+
+        projection = dict(model.named_modules())[name.rsplit('.', 1)[0]]
+        captured = []
+        handle = projection.register_forward_pre_hook(lambda module, args: captured.append(args[0]))
+        was_training = model.training
+        try:
+            model.eval()
+            with torch.no_grad():
+                x = batch_inputs.to(device=weight.device, dtype=weight.dtype)
+                y = batch_targets.to(device=weight.device, dtype=weight.dtype)
+                horizon, history = design["pred_len"], design["label_len"]
+                decoder = torch.cat([x[:, x.shape[1] - history:], x.new_zeros(len(x), horizon, x.shape[2])], dim=1)
+                output = model(x, self.all_batch_input_marks[batch_number].to(weight.device), decoder,
+                               self.all_batch_target_marks[batch_number].to(weight.device))
+                output = output[0] if isinstance(output, (tuple, list)) else output
+                if len(captured) != 1:
+                    raise ValueError("Expected one final projection invocation for client evaluation.")
+                hidden = captured[0][:, -horizon:]
+                raw = output[:, -horizon:]
+                if not torch.allclose(raw, F.linear(captured[0], projection.weight, projection.bias)[:, -horizon:], rtol=1e-5, atol=1e-6):
+                    raise ValueError("Client forecast is not the raw final linear projection.")
+                output = raw[..., -1:] if design["features"] == "MS" else raw
+                if output.shape != y.shape:
+                    raise ValueError("Recorded targets do not match client forecast loss slicing.")
+                values = x[..., design["property_channel"]]
+                if design["threshold_units"] == "physical" and design["scale"]:
+                    c = design["property_channel"]
+                    values = values * design["scaler_scale"][c] + design["scaler_mean"][c]
+                if not torch.isfinite(values).all():
+                    raise ValueError("Non-finite client property inputs.")
+                phi = run_fractions((values > design["threshold"]).cpu().numpy(), design["duration"])
+                truth = float(phi.mean())
+                details = []
+                for q, (k, j) in enumerate(coordinates):
+                    ell = 0 if design["features"] == "MS" else k
+                    h = hidden[..., j]
+                    raw_analytic = ((2.0 / K) * ((output[..., ell] - y[..., ell]) * h).mean(dim=1)).mean().item()
+                    if strategy == "constant_bias":
+                        if torch.count_nonzero(projection.weight[k]).item() or projection.bias[k].item() != projection.bias.new_tensor(design["C"]).item():
+                            raise ValueError("Client model does not retain the constant-bias measurement row.")
+                        analytic = K * raw_analytic / (2 * design["C"])
+                    else:
+                        analytic = (raw_analytic - design["beta"]) / design["alpha"]
+                    if not np.isclose(scalars[q], raw_analytic, rtol=1e-4, atol=1e-5) or not np.isclose(individual[q], analytic, rtol=1e-4, atol=1e-5):
+                        raise ValueError(f"Recorded client gradient identity failed at [{k}, {j}] in batch {batch_number}; check model state, data and defenses.")
+                    detail = {"coordinate": [k, j], "gradient_scalar": float(scalars[q]),
+                              "estimate": float(individual[q]), "raw_analytic_gradient": raw_analytic,
+                              "analytic_measurement": analytic, "feature_average": h.mean().item(),
+                              "raw_identity_error": abs(float(scalars[q]) - raw_analytic),
+                              "identity_error": abs(float(individual[q]) - analytic),
+                              "signed_error": float(individual[q]) - truth}
+                    if strategy == "constant_bias":
+                        detail["target_correction"] = (y[..., ell] * h).mean().item() / design["C"]
+                    details.append(detail)
+        finally:
+            handle.remove()
+            model.train(was_training)
+        row = {"batch": batch_number, "batch_size": len(batch_inputs), "estimate": estimate,
+               "true_property": truth, "per_window_true_property": phi.tolist(),
+               "signed_error": estimate - truth, "absolute_error": abs(estimate - truth),
+               "constant_error": abs(preparation["constant_property_baseline"] - truth),
+               "measurements": details,
+               "identity_error": max(d["identity_error"] for d in details)}
+        if len(coordinates) > 1:
+            row.update({"coordinates": coordinates, "gradient_scalars": scalars.tolist(),
+                        "individual_estimates": individual.tolist()})
+        else:
+            row["gradient_scalar"] = float(scalars[0])
+        self._print_batch(f"Client property batch {batch_number}: original={truth:.6f}, estimate={estimate:.6f}, "
+                          f"absolute error={row['absolute_error']:.6f}, measurements={individual.tolist()}")
+        return row
+
+    def _save_client_property_inference_report(self, config):
+        preparation = self.poison_feasibility_results
+        design = preparation["design"]
+        coordinates = design.get("coordinates", [design.get("coordinate")])
+        rows = [self._property_inference_rows[k] for k in sorted(self._property_inference_rows)]
+        report = {"evaluation": "recorded_client_gradients", "design": design, "config": config,
+                  "constant_property_baseline": preparation["constant_property_baseline"], "results": []}
+        for size in sorted({row["batch_size"] for row in rows}):
+            batch_rows = [row for row in rows if row["batch_size"] == size]
+            errors = np.array([row["signed_error"] for row in batch_rows])
+            result = {"batch_size": size, "batches": len(batch_rows), "rows": batch_rows,
+                      "mae": float(np.abs(errors).mean()), "rmse": float(np.sqrt(np.square(errors).mean())),
+                      "bias": float(errors.mean()),
+                      "constant_mae": float(np.mean([row["constant_error"] for row in batch_rows]))}
+            if len(coordinates) > 1:
+                errors_by_coordinate = np.array([[d["signed_error"] for d in row["measurements"]] for row in batch_rows])
+                result["coordinate_summary"] = [
+                    {"coordinate": q, "mae": float(np.abs(errors_by_coordinate[:, i]).mean()),
+                     "rmse": float(np.sqrt(np.square(errors_by_coordinate[:, i]).mean())),
+                     "bias": float(errors_by_coordinate[:, i].mean())} for i, q in enumerate(coordinates)]
+                result["coordinate_summary"].append({"coordinate": "ensemble", **{key: result[key] for key in ['mae', 'rmse', 'bias']}})
+                matrix = [[None for _ in coordinates] for _ in coordinates]
+                for i in range(len(coordinates)):
+                    for j in range(len(coordinates)):
+                        if len(batch_rows) > 1 and np.ptp(errors_by_coordinate[:, i]) > 0 and np.ptp(errors_by_coordinate[:, j]) > 0:
+                            value = float(np.corrcoef(errors_by_coordinate[:, i], errors_by_coordinate[:, j])[0, 1])
+                            matrix[i][j] = value if np.isfinite(value) else None
+                result["signed_error_correlation"] = {"coordinates": coordinates, "matrix": matrix}
+            report["results"].append(result)
+        if config.get("attack_mode") == "both":
+            comparison = []
+            for result in report["results"]:
+                for method, key in [("direct_property_inference", "signed_error"),
+                                    ("gradient_inversion", "reconstruction_signed_error")]:
+                    errors = np.array([row[key] for row in result["rows"]])
+                    comparison.append({"batch_size": result["batch_size"], "method": method,
+                                       "batches": len(errors), "mae": float(np.abs(errors).mean()),
+                                       "rmse": float(np.sqrt(np.square(errors).mean())), "bias": float(errors.mean())})
+            report["method_comparison"] = comparison
+            report["reconstruction_run_dir"] = str(self._reconstruction_run_dir)
+        root = Path(config.get("property_inference_output_dir") or Path(__file__).resolve().parents[3] / "evaluation_results")
+        root.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d_%H%M%S_%f%z")
+        path = root / f"{config['dataset']}_client_property_{stamp}.json"
+        path.write_text(json.dumps(report, indent=2, default=str) + '\n')
+        lines = [f"# Client property inference: {config['dataset']} ({design.get('strategy', 'constant_bias')})", "",
+                 "Direct estimates use recorded client gradients only. Client inputs/targets provide ground truth and numerical identity checks; no client-data calibration is performed.", ""]
+        if config.get("attack_mode") == "both":
+            lines += ["## Direct inference versus gradient inversion", "",
+                      "Both methods use the same recorded client batches and poisoned model states. The inversion estimate is the exact configured property measured in the reconstructed inputs. Errors are fractions, not time-series reconstruction MSE.", "",
+                      "| Batch | Batch size | Original property | Direct estimate | Reconstruction property | Direct absolute error | Inversion absolute error |",
+                      "|---:|---:|---:|---:|---:|---:|---:|"]
+            for row in rows:
+                lines.append(f"| {row['batch'] + 1} | {row['batch_size']} | {row['true_property']:.6f} | {row['estimate']:.6f} | {row['reconstruction_estimate']:.6f} | {row['absolute_error']:.6f} | {row['reconstruction_absolute_error']:.6f} |")
+            lines += ["", "| Batch size | Method | Batches | Property MAE | Property RMSE | Signed bias |",
+                      "|---:|:---|---:|---:|---:|---:|"]
+            for result in report["method_comparison"]:
+                lines.append(f"| {result['batch_size']} | {result['method']} | {result['batches']} | {result['mae']:.6f} | {result['rmse']:.6f} | {result['bias']:+.6f} |")
+            lines.append("")
+        tables = self._poison_feasibility_batch_tables(report)
+        tables[0] = "## Recorded client batches: original property versus gradient estimate"
+        tables = [line.replace('held-out batches', 'client batches') for line in tables]
+        lines += tables
+        lines += ["## Aggregate errors", "", "| Batch size | Batches | MAE | RMSE | Bias | Auxiliary constant MAE |",
+                  "|---:|---:|---:|---:|---:|---:|"]
+        for result in report['results']:
+            lines.append(f"| {result['batch_size']} | {result['batches']} | {result['mae']:.6f} | {result['rmse']:.6f} | {result['bias']:+.6f} | {result['constant_mae']:.6f} |")
+        lines += ["", "## Measurement diagnostics", "", "| Batch | Coordinate | Raw gradient | Analytical gradient | Decoded estimate | Analytical estimate | Identity error |",
+                  "|---:|:---|---:|---:|---:|---:|---:|"]
+        for row in rows:
+            for d in row['measurements']:
+                lines.append(f"| {row['batch'] + 1} | {d['coordinate']} | {d['gradient_scalar']:.8g} | {d['raw_analytic_gradient']:.8g} | {d['estimate']:.6f} | {d['analytic_measurement']:.6f} | {d['identity_error']:.3e} |")
+        lines += ["", "## Preparation and run settings", "", "```json", json.dumps({"design": design, "config": config}, indent=2, default=str), "```", ""]
+        path.with_suffix('.md').write_text('\n'.join(lines))
+        self.client_property_inference_results = report
+        self._print_batch("Client property inference report:", path.with_suffix('.md'))
+        return path
+
+    def gradient_inversion_attack(self, model, config, batch_number, original_dy_dx, dummy_inputs, dummy_targets, batch_inputs, batch_targets):
         if not hasattr(self, "_attack_context"):
             self._attack_context = threading.local()
         self._attack_context.batch_number = batch_number
@@ -1140,6 +1401,7 @@ class AttackTSInverseWorker(Worker):
 
         if config["dataset"] in ETT_DATASETS:
             self._save_batch_reconstruction(config, batch_number, batch_inputs, dummy_inputs)
+        return dummy_inputs.detach()
 
     def learned_prior_regularization(self, dummy_inputs, dummy_targets, regularization_inputs, regularization_targets, config):
         learned_prior_regularization = torch.zeros(1, device=dummy_inputs.device)
@@ -1691,293 +1953,629 @@ class AttackTSInverseWorker(Worker):
         return all_dummy_inputs, all_dummy_targets
 
     def load_or_train_poisoned_global_model(self, model, config):
-        """Prepare a forecasting model with target-channel property-aware training.
+        """Train an existing projection coordinate as a property measurement.
 
-        First load poison_base_checkpoint_path (a clean state_dict or a dictionary
-        with model_state_dict), or warm up on unmodified auxiliary forecasts for
-        poison_pretrain_epochs (default: model_train_epochs if positive, otherwise
-        poison_train_epochs). Then optimize forecast MSE + poison_property_weight
-        * property MSE. Only the forecasting model is returned and checkpointed.
-
-        Property: fraction of input timesteps in runs strictly exceeding
-        poison_property_threshold (default 0.5, in preprocessed units), lasting at
-        least poison_property_duration steps (default 1). The temporary sigmoid
-        head predicts a fraction in [0, 1] from the encoder representation.
-        poison_property_weight defaults to 1.0; poison_property_hidden_size to 64.
-        poison_representation_layer defaults to 'encoder'; pooling defaults to
-        'target_token' for iTransformer and 'mean' for other models, configurable
-        via poison_representation_pool. The encoder must output [batch, tokens, D].
-
-        This is a representation-learning intervention, not a measured guarantee
-        of increased gradient leakage. Client losses and reconstruction stay intact.
+        No model architecture or client loss changes. constant_bias zeros a
+        projection row and sets its bias to C; fixed_projection preserves the
+        entire projection and learns the actual residual-times-feature measurement.
+        Always validate actual raw mean-MSE gradients on a purged temporal holdout.
         """
-        if config["dataset"] not in ETT_DATASETS:
-            raise ValueError("Poisoned global-model training currently supports ETT datasets only.")
-        if config.get("aux_dataset") is not None:
-            raise ValueError(
-                "Poison training uses the ETT held-out splits; custom aux_dataset is not supported. "
-                "Set poison_auxiliary_split to 'test' or 'val'."
-            )
+        from pi_eval.property_inference import run_fractions
+
+        poison_strategy = config.get("poison_strategy", "fixed_projection")
+        if poison_strategy not in {"constant_bias", "fixed_projection"}:
+            raise ValueError("poison_strategy must be 'constant_bias' or 'fixed_projection'.")
+        if config["dataset"] not in ETT_DATASETS or config.get("aux_dataset") is not None:
+            raise ValueError("Weights-only measurement preparation requires the existing ETT auxiliary splits.")
+        feasibility_only = config.get("poison_feasibility_only", False)
+        if not feasibility_only and (config.get("update_model", False)
+                                    or config.get("defense_name", "none") not in {None, "none"}):
+            raise ValueError("This measurement supports raw gradients at the fixed model: use update_model=False "
+                             "and defense_name='none', or poison_feasibility_only=True for an auxiliary-only check.")
+        if config.get("forecast_loss_reduction", "mean") != "mean":
+            raise ValueError("The measurement identity requires mean MSE over batch, horizon and selected channels.")
         dataset = self.train_datasets[0]
-        mode = dataset.features  # config['features'] can contain model feature indices.
-        source = Path(dataset.root_path) / dataset.data_path
-        channels = ([dataset.target] if mode == "S" else list(pd.read_csv(source, nrows=0).columns[1:]))
-        requested = config.get("poison_target_channel")
-        if isinstance(requested, str) and requested in channels:
-            channel_index = channels.index(requested)
-        elif type(requested) is int and 0 <= requested < len(channels):
-            channel_index = requested
-        else:
-            raise ValueError(f"poison_target_channel must be a channel name in {channels} or its zero-based index.")
-        split = config.get("poison_auxiliary_split", "test")
-        if split not in {"test", "val"}:
-            raise ValueError("poison_auxiliary_split must be 'test' or 'val'.")
-        epochs = config.get("poison_train_epochs", 10)
-        batch_size = config.get("poison_train_batch_size", config.get("model_train_batch_size", 32))
-        learning_rate = config.get("poison_train_learning_rate", config.get("model_train_learning_rate", 1e-4))
-        seed = config.get("poison_seed", config["seed"])
-        if type(epochs) is not int or epochs < 1 or type(batch_size) is not int or batch_size < 1:
-            raise ValueError("poison_train_epochs and poison_train_batch_size must be positive integers.")
-        if not np.isfinite(learning_rate) or learning_rate <= 0:
-            raise ValueError("poison_train_learning_rate must be positive and finite.")
+        mode = dataset.features
         if mode not in {"M", "MS", "S"}:
             raise ValueError(f"Unsupported ETT feature mode {mode!r}.")
-        auxiliary_sets = self.test_datasets if split == "test" else self.val_datasets
-        # Discard the loader's lookback prefix so auxiliary windows stay entirely
-        # in the requested held-out split (especially important for validation).
-        auxiliary = ConcatDataset([
-            Subset(part, range(part.seq_len, len(part))) for part in auxiliary_sets
-        ])
-        if len(auxiliary) == 0:
-            raise ValueError("No auxiliary windows remain after excluding split lookback rows.")
-        if any((part.features, part.seq_len, part.label_len, part.pred_len) !=
-               (mode, dataset.seq_len, dataset.label_len, dataset.pred_len) for part in auxiliary_sets):
-            raise ValueError("Auxiliary ETT preprocessing must match the benign training dataset.")
+        source = Path(dataset.root_path) / dataset.data_path
+        channels = ([dataset.target] if mode == "S" else list(pd.read_csv(source, nrows=0).columns[1:]))
 
-        property_weight = config.get("poison_property_weight", 1.0)
-        threshold = config.get("poison_property_threshold", 0.5)
+        def channel_index(value, key):
+            if isinstance(value, str) and value in channels:
+                return channels.index(value)
+            if type(value) is int and 0 <= value < len(channels):
+                return value
+            raise ValueError(f"{key} must be a name in {channels} or a zero-based channel index.")
+
+        c = channel_index(config.get("poison_target_channel"), "poison_target_channel")
+        layer_name = config.get("poison_projection_layer", "decoder.projection")
+        projection = dict(model.named_modules()).get(layer_name)
+        if not isinstance(projection, nn.Linear) or projection.bias is None:
+            raise ValueError(f"Expected an existing biased final Linear at {layer_name!r}. "
+                             "Use the vanilla Transformer; iTransformer's output path is unsupported.")
+        if projection.out_features != len(channels):
+            raise ValueError("Final projection channels must match the dataset channel order.")
+        if "poison_gradient_coordinates" in config:
+            if poison_strategy != "fixed_projection":
+                raise ValueError("poison_gradient_coordinates is supported only for fixed_projection.")
+            requested_coordinates = config["poison_gradient_coordinates"]
+            if not isinstance(requested_coordinates, list) or not requested_coordinates:
+                raise ValueError("poison_gradient_coordinates must be a nonempty list.")
+        else:
+            requested_coordinates = [{
+                "channel": config.get("poison_measurement_channel", channels[-1] if mode == "MS" else channels[c]),
+                "hidden_coordinate": config.get("poison_hidden_coordinate", 0),
+            }]
+        coordinates = []
+        for coordinate in requested_coordinates:
+            if not isinstance(coordinate, dict) or "channel" not in coordinate or "hidden_coordinate" not in coordinate:
+                raise ValueError("Each measurement coordinate requires channel and hidden_coordinate.")
+            k = channel_index(coordinate["channel"], "measurement channel")
+            j = coordinate["hidden_coordinate"]
+            if type(j) is not int or not 0 <= j < projection.in_features:
+                raise ValueError("Measurement hidden_coordinate is outside the projection's hidden dimension.")
+            if mode == "MS" and k != len(channels) - 1:
+                raise ValueError("MS measurement must use the last output channel selected by the client loss.")
+            if [k, j] in coordinates:
+                raise ValueError(f"Duplicate measurement coordinate [{k}, {j}].")
+            coordinates.append([k, j])
+        M = len(coordinates)
+        multi = M > 1
+        k, j = coordinates[0]  # Legacy scalar path is unchanged when M == 1.
+        if poison_strategy == "constant_bias":
+            C = config.get("poison_measurement_C", 10.0)
+            if not np.isfinite(C) or C <= 0:
+                raise ValueError("poison_measurement_C must be positive and finite.")
+        else:
+            alpha = config.get("poison_gradient_scale", 1.0)
+            beta = config.get("poison_gradient_offset", 0.0)
+            rho = config.get("poison_max_relative_weight_change")
+            ensemble_weight = config.get("poison_ensemble_loss_weight", 0.5)
+            if not np.isfinite(ensemble_weight) or not 0 <= ensemble_weight < 1:
+                raise ValueError("poison_ensemble_loss_weight must be finite and in [0, 1).")
+            if not np.isfinite(alpha) or alpha == 0 or not np.isfinite(beta):
+                raise ValueError("poison_gradient_scale must be finite and nonzero; poison_gradient_offset must be finite.")
+            if rho is not None and (not np.isfinite(rho) or rho < 0):
+                raise ValueError("poison_max_relative_weight_change must be None or finite and nonnegative.")
+        tau = config.get("poison_property_threshold", .5)
         duration = config.get("poison_property_duration", 1)
-        hidden_size = config.get("poison_property_hidden_size", 64)
-        base_path = config.get("poison_base_checkpoint_path")
-        base_path = Path(base_path) if base_path else None
-        pretrain_epochs = config.get(
-            "poison_pretrain_epochs",
-            0 if base_path else (config.get("model_train_epochs", 0) or epochs),
-        )
-        if not np.isfinite(property_weight) or property_weight < 0:
-            raise ValueError("poison_property_weight must be finite and nonnegative (0 is a forecast-only control).")
-        if not np.isfinite(threshold):
+        units = config.get("poison_property_units", "standardized" if dataset.scale else "physical")
+        if not np.isfinite(tau):
             raise ValueError("poison_property_threshold must be finite.")
         if type(duration) is not int or not 1 <= duration <= dataset.seq_len:
             raise ValueError("poison_property_duration must be between 1 and seq_len.")
-        if type(hidden_size) is not int or hidden_size < 1:
-            raise ValueError("poison_property_hidden_size must be a positive integer.")
-        if type(pretrain_epochs) is not int or pretrain_epochs < 0 or (base_path is None and pretrain_epochs == 0):
-            raise ValueError("Use positive poison_pretrain_epochs or supply a clean poison_base_checkpoint_path.")
-        layer_name = config.get("poison_representation_layer", "encoder")
-        representation_layer = dict(model.named_modules()).get(layer_name)
-        if representation_layer is None or not layer_name:
-            raise ValueError(f"Model has no internal representation layer {layer_name!r}.")
-        pooling = config.get("poison_representation_pool", "target_token" if model.name == "iTransformer" else "mean")
-        if pooling not in {"mean", "target_token"}:
-            raise ValueError("poison_representation_pool must be 'mean' or 'target_token'.")
+        if units not in {"standardized", "physical"} or (units == "standardized" and not dataset.scale):
+            raise ValueError("Use standardized property units only with scaled inputs, or choose physical units.")
+        scaler = dataset.scaler if dataset.scale else None
+        property_mean = float(scaler.mean_[c]) if scaler is not None and units == "physical" else 0.0
+        property_scale = float(scaler.scale_[c]) if scaler is not None and units == "physical" else 1.0
+        if poison_strategy == "constant_bias":
+            feature_epochs = config.get("poison_feature_epochs", config.get("poison_pretrain_epochs", 5))
+        else:
+            feature_epochs = 0
+        measurement_epochs = config.get("poison_train_epochs", 10)
+        batch_size = config.get("poison_train_batch_size", config.get("model_train_batch_size", 32))
+        lr = config.get("poison_train_learning_rate", config.get("model_train_learning_rate", 1e-4))
+        seed = config.get("poison_seed", config["seed"])
+        fraction = config.get("poison_holdout_fraction", .2)
+        max_validation_batches = config.get("poison_validation_batches", 8)
+        tolerance = config.get("poison_feasibility_tolerance", .05)
+        if (type(feature_epochs) is not int or feature_epochs < 0 or type(measurement_epochs) is not int
+                or measurement_epochs < 1 or type(batch_size) is not int or batch_size < 1):
+            raise ValueError("Use nonnegative feature epochs and positive measurement epochs and batch size.")
+        if not np.isfinite(lr) or lr <= 0 or not 0 < fraction < 1:
+            raise ValueError("Use positive finite learning rate and 0 < poison_holdout_fraction < 1.")
+        if type(max_validation_batches) is not int or max_validation_batches < 1:
+            raise ValueError("poison_validation_batches must be positive.")
+        if not np.isfinite(tolerance) or tolerance < 0:
+            raise ValueError("poison_feasibility_tolerance must be finite and nonnegative.")
+        requested_sizes = config.get("poison_validation_batch_sizes", [1, 8, 32, 128, config.get("batch_size", 32)])
+        if not isinstance(requested_sizes, (list, tuple)) or not requested_sizes or any(type(n) is not int or n < 1 for n in requested_sizes):
+            raise ValueError("poison_validation_batch_sizes must be a nonempty list of positive integers.")
+        split = config.get("poison_auxiliary_split", "test")
+        if split not in {"test", "val"}:
+            raise ValueError("poison_auxiliary_split must be 'test' or 'val'.")
+        auxiliary_sets = self.test_datasets if split == "test" else self.val_datasets
+        preparation_parts, holdout_parts, partitions = [], [], []
+        for part in auxiliary_sets:
+            if (part.features, part.seq_len, part.label_len, part.pred_len) != (mode, dataset.seq_len, dataset.label_len, dataset.pred_len):
+                raise ValueError("Auxiliary preprocessing/window lengths must match the benign dataset.")
+            if ((Path(part.root_path) / part.data_path).resolve() != source.resolve()
+                    or (part.target, part.scale, part.timeenc, part.freq)
+                    != (dataset.target, dataset.scale, dataset.timeenc, dataset.freq)
+                    or (scaler is not None and (
+                        not np.array_equal(part.scaler.mean_, scaler.mean_)
+                        or not np.array_equal(part.scaler.scale_, scaler.scale_)))):
+                raise ValueError("Auxiliary channel order, source and scaling must match the benign dataset.")
+            span = part.seq_len + part.pred_len
+            raw_length = len(part) + span - 1
+            start = part.seq_len  # Skip the ETT loader's preceding-split lookback.
+            boundary = start + int((raw_length - start) * (1 - fraction))
+            train_stop = boundary - span + 1
+            if train_stop <= start or boundary >= len(part):
+                raise ValueError("Auxiliary partition too short for a disjoint preparation/holdout split. "
+                                 "Use more data or shorter windows.")
+            preparation_parts.append(Subset(part, range(start, train_stop)))
+            holdout_parts.append(Subset(part, range(boundary, len(part))))
+            partitions.append({"preparation_start": start, "preparation_stop": train_stop,
+                               "holdout_start": boundary, "holdout_stop": len(part), "window_span": span})
+        if not preparation_parts:
+            raise ValueError("No auxiliary datasets available.")
+        preparation, holdout = ConcatDataset(preparation_parts), ConcatDataset(holdout_parts)
+        validation_sizes = sorted({n for n in requested_sizes if n <= len(holdout)})
+        if not validation_sizes:
+            raise ValueError("No requested validation batch size fits the held-out partition.")
+        decoding = f"C={C:g}" if poison_strategy == "constant_bias" else f"alpha={alpha:g}, beta={beta:g}"
+        measurement_description = f"coordinates={coordinates}" if multi else f"output={channels[k]}, hidden={j}"
+        print(f"[Poison] Weights-only measurement ({poison_strategy}): input={channels[c]}, {measurement_description}, "
+              f"{decoding}, threshold>{tau:g} ({units}), duration={duration}", flush=True)
+        print(f"[Poison] Auxiliary {split}: {len(preparation)} preparation windows, {len(holdout)} held-out windows. "
+              f"Purged temporal partitions (inputs AND forecast labels): {partitions}", flush=True)
+        if len(validation_sizes) != len(set(requested_sizes)):
+            print(f"[Poison] Skipping batch sizes larger than holdout; evaluating {validation_sizes}.", flush=True)
+        if config.get("defense_name", "none") not in {None, "none"}:
+            print("[Poison] Feasibility check uses RAW mean-MSE gradients; configured client defenses are not applied.", flush=True)
+
+        parameter_names = [name for name, p in model.named_parameters() if p.requires_grad]
+        weight_name = next(name for name, p in model.named_parameters() if p is projection.weight)
+        if weight_name not in parameter_names or not projection.bias.requires_grad:
+            raise ValueError("The client's projection weight and bias must be trainable.")
+        base_path = config.get("poison_base_checkpoint_path")
         base_identity = None
-        if base_path is not None:
+        if base_path:
+            base_path = Path(base_path)
             base_identity = {"path": str(base_path.resolve()), "size": base_path.stat().st_size,
                              "mtime_ns": base_path.stat().st_mtime_ns}
-
         metadata = {
-            "method": "property_multitask_elevated_fraction_v1",
-            "base_checkpoint": base_identity, "pretrain_epochs": pretrain_epochs,
-            "property_weight": property_weight, "property_threshold": threshold,
-            "property_duration": duration, "property_hidden_size": hidden_size,
-            "representation_layer": layer_name, "representation_pool": pooling,
-            "dataset": config["dataset"], "source_csv": str(source.resolve()),
-            "source_size": source.stat().st_size, "source_mtime_ns": source.stat().st_mtime_ns,
-            "model_class": f"{type(model).__module__}.{type(model).__qualname__}",
-            "model_architecture": repr(model),
-            "channels": channels, "channel_index": channel_index,
-            "features": mode, "target": dataset.target, "scale": dataset.scale,
-            "timeenc": dataset.timeenc, "freq": dataset.freq,
+            "method": "weights_only_projection_measurement_v1", "dataset": config["dataset"],
+            "model_class": f"{type(model).__module__}.{type(model).__qualname__}", "architecture": repr(model),
+            "parameter_names": parameter_names, "weight_name": weight_name, "coordinate": [k, j],
+            "source_csv": str(source.resolve()), "source_size": source.stat().st_size,
+            "source_mtime_ns": source.stat().st_mtime_ns,
+            "channels": channels, "property_channel": c, "features": mode, "target": dataset.target,
             "seq_len": dataset.seq_len, "label_len": dataset.label_len, "pred_len": dataset.pred_len,
-            "auxiliary_split": split, "auxiliary_windows": len(auxiliary),
-            "epochs": epochs, "batch_size": batch_size, "learning_rate": learning_rate,
-            "seed": seed, "initialization_seed": config["seed"],
+            "scale": dataset.scale, "timeenc": dataset.timeenc, "freq": dataset.freq,
+            "scaler_mean": scaler.mean_.tolist() if scaler is not None else None,
+            "scaler_scale": scaler.scale_.tolist() if scaler is not None else None,
+            "threshold": tau, "threshold_units": units, "duration": duration,
+            "auxiliary_split": split, "partitions": partitions, "base_checkpoint": base_identity,
+            "feature_epochs": feature_epochs, "measurement_epochs": measurement_epochs,
+            "batch_size": batch_size, "learning_rate": lr, "seed": seed, "initialization_seed": config["seed"],
         }
+        if poison_strategy == "constant_bias":
+            # Keep the legacy metadata and digest exactly: absent strategy means constant_bias.
+            metadata["C"] = C
+        else:
+            metadata.update({"method": "weights_only_fixed_projection_measurement_v1",
+                             "strategy": poison_strategy, "alpha": alpha, "beta": beta,
+                             "training_stages": [["measurement", measurement_epochs]],
+                             "max_relative_weight_change": rho})
+            if multi:
+                del metadata["coordinate"]
+                metadata.update({"method": "weights_only_fixed_projection_multi_measurement_v1",
+                                 "coordinates": coordinates, "ensemble_loss_weight": ensemble_weight,
+                                 "aggregation": "arithmetic_mean"})
         digest = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()[:16]
         checkpoint_path = Path(config.get("poison_checkpoint_path") or (
             Path(__file__).resolve().parents[3] / "models" / "poisoned_global"
-            / f"{config['dataset']}_{channels[channel_index]}_{digest}.pt"
-        ))
-        config.update({
-            "poison_checkpoint_path": str(checkpoint_path.resolve()),
-            "poison_target_channel_name": channels[channel_index],
-            "poison_target_channel_index": channel_index,
-            "poison_auxiliary_split": split,
-            "poison_train_epochs": epochs, "poison_train_batch_size": batch_size,
-            "poison_train_learning_rate": learning_rate, "poison_seed": seed,
-            "poison_method": metadata["method"],
-            "poison_pretrain_epochs": pretrain_epochs,
-            "poison_base_checkpoint_path": str(base_path.resolve()) if base_path else None,
-            "poison_property_weight": property_weight, "poison_property_threshold": threshold,
-            "poison_property_duration": duration, "poison_property_hidden_size": hidden_size,
-            "poison_representation_layer": layer_name, "poison_representation_pool": pooling,
-        })
+            / f"{config['dataset']}_weights_only_{digest}.pt"))
+        load_checkpoint = checkpoint_path.is_file() and not config.get("poison_force_retrain", False)
         model.to(config["device"])
-        if checkpoint_path.is_file() and not config.get("poison_force_retrain", False):
+        if load_checkpoint:
             checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
             if checkpoint.get("poisoning") != metadata:
-                raise ValueError(
-                    f"Poison checkpoint metadata does not match this experiment: {checkpoint_path}. "
-                    "Use a different path or set poison_force_retrain=True."
-                )
+                raise ValueError(f"Incompatible weights-only checkpoint: {checkpoint_path}. "
+                                 "Choose a new path or set poison_force_retrain=True.")
             model.load_state_dict(checkpoint["model_state_dict"], strict=True)
-            model.zero_grad(set_to_none=True)
-            model.eval()
-            config["poison_model_source"] = "checkpoint"
-            print(f"[Poison] Loaded channel {channels[channel_index]} model from {checkpoint_path}")
-            return model
+            if poison_strategy == "fixed_projection":
+                projection_reference = checkpoint.get("projection_reference")
+                if not isinstance(projection_reference, dict) or any(
+                    not isinstance(projection_reference.get(name), torch.Tensor)
+                    or not torch.equal(value.detach().cpu(), projection_reference[name])
+                    for name, value in [("weight", projection.weight), ("bias", projection.bias)]
+                ):
+                    raise ValueError("Checkpoint does not preserve its original complete projection weight and bias.")
+        else:
+            if base_path:
+                base = torch.load(base_path, map_location="cpu", weights_only=True)
+                if "poisoning" in base or "measurement" in base:
+                    raise ValueError("poison_base_checkpoint_path must be an unpoisoned model checkpoint.")
+                model.load_state_dict(base.get("model_state_dict", base), strict=True)
+            if poison_strategy == "constant_bias":
+                with torch.no_grad():
+                    projection.weight[k].zero_()
+                    projection.bias[k].fill_(C)
+        if poison_strategy == "constant_bias":
+            if torch.count_nonzero(projection.weight[k]).item() or projection.bias[k].item() != projection.bias.new_tensor(C).item():
+                raise ValueError("Checkpoint must have measurement projection row exactly zero and bias exactly C.")
+        else:
+            # On reload the saved original reference was checked above. On a new
+            # run this snapshots the starting projection after optional base loading.
+            projection_reference = {"weight": projection.weight.detach().clone(),
+                                    "bias": projection.bias.detach().clone()}
 
-        loader = DataLoader(
-            auxiliary, batch_size=batch_size, shuffle=True,
-            generator=torch.Generator().manual_seed(seed), worker_init_fn=seed_worker,
-        )
+        def loader(data, size, shuffle=False):
+            return DataLoader(data, batch_size=size, shuffle=shuffle, worker_init_fn=seed_worker,
+                              generator=torch.Generator().manual_seed(seed))
+
+        def properties(x):
+            with torch.no_grad():
+                values = x[..., c] * property_scale + property_mean
+                if not torch.isfinite(values).all():
+                    raise ValueError("Non-finite auxiliary property inputs.")
+                scores = run_fractions((values > tau).detach().cpu().numpy(), duration)
+                return torch.as_tensor(scores, device=x.device, dtype=x.dtype)
+
+        captured = []
+
+        def capture(module, inputs):
+            captured[:] = [inputs[0]]  # Keep the graph for preparation, remove the hook before returning.
+
+        handle = projection.register_forward_pre_hook(capture)
+        original_flags = {name: p.requires_grad for name, p in model.named_parameters()}
+        K = 1 if mode == "MS" else len(channels)
+        loss_channel = 0 if mode == "MS" else k
+        m = dataset.pred_len * K
+        if multi:
+            row_indices = torch.tensor([q[0] for q in coordinates], device=projection.weight.device)
+            hidden_indices = torch.tensor([q[1] for q in coordinates], device=projection.weight.device)
+            loss_indices = torch.zeros_like(row_indices) if mode == "MS" else row_indices
+
+        def batch_values(batch):
+            x, y, xm, ym = (value.float().to(config["device"]) for value in batch)
+            if x.shape[-1] != len(channels):
+                raise ValueError("Input channel ordering/shape does not match the configured ETT dataset.")
+            decoder = torch.cat([y[:, :dataset.label_len], torch.zeros_like(y[:, -dataset.pred_len:])], dim=1)
+            captured.clear()
+            output = model(x, xm, decoder, ym)
+            output = output[0] if isinstance(output, (tuple, list)) else output
+            if not captured or captured[0].ndim != 3:
+                raise ValueError("Expected [batch, horizon, hidden] activation before the final projection.")
+            projection_input = captured.pop()
+            hidden = projection_input[:, -dataset.pred_len:]
+            raw_output = output[:, -dataset.pred_len:]
+            # Reject normalization, nonlinearities or other processing after the
+            # projection: the raw linear identity must match the actual client.
+            linear_output = F.linear(projection_input, projection.weight, projection.bias)[:, -dataset.pred_len:]
+            if raw_output.shape != linear_output.shape or not torch.allclose(raw_output, linear_output, rtol=1e-5, atol=1e-6):
+                raise ValueError("The configured projection is not the raw final forecast layer; measurement identity is unsupported.")
+            f_dim = -1 if mode == "MS" else 0
+            output, targets = raw_output[..., f_dim:], y[:, -dataset.pred_len:, f_dim:]
+            if output.shape != targets.shape or output[0].numel() != m:
+                raise ValueError("Forecast/target slicing does not match mean-MSE measurement coordinates.")
+            h = hidden.index_select(2, hidden_indices) if multi else hidden[..., j]
+            phi = properties(x)
+            if poison_strategy == "constant_bias":
+                s = ((1 - targets[..., loss_channel] / C) * h).mean(dim=1)
+            else:
+                if multi:
+                    residual = output.index_select(2, loss_indices) - targets.index_select(2, loss_indices)
+                else:
+                    residual = output[..., loss_channel] - targets[..., loss_channel]
+                gradient_contribution = (2.0 / K) * (residual * h).mean(dim=1)
+                s = (gradient_contribution - beta) / alpha
+            return output, targets, h, phi, s
+
         device = torch.device(config["device"])
         cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
-
-        def forecast_batch(batch):
-            batch_x, batch_y, x_mark, y_mark = (t.float().to(device) for t in batch)
-            if batch_x.shape[-1] != len(channels) or batch_y.shape[-1] != len(channels):
-                raise ValueError("Auxiliary channel count does not match the ETT CSV.")
-            # The client forecasting inputs, decoder history and labels are unmodified.
-            decoder = torch.cat([
-                batch_y[:, :dataset.label_len],
-                torch.zeros_like(batch_y[:, -dataset.pred_len:]),
-            ], dim=1)
-            outputs = model(batch_x, x_mark, decoder, y_mark)
-            if isinstance(outputs, tuple):
-                outputs = outputs[0]
-            f_dim = -1 if mode == "MS" else 0
-            outputs = outputs[:, -dataset.pred_len:, f_dim:]
-            targets = batch_y[:, -dataset.pred_len:, f_dim:]
-            if outputs.shape != targets.shape:
-                raise ValueError(f"Poison forecast shape {outputs.shape} differs from targets {targets.shape}.")
-            return batch_x, F.mse_loss(outputs, targets), targets.numel()
-
-        def property_labels(batch_x):
-            with torch.no_grad():
-                elevated = batch_x[..., channel_index] > threshold
-                if duration > 1:
-                    # Mark every timestep belonging to a qualifying sustained run.
-                    # Overlapping qualifying windows count each timestep only once.
-                    runs = elevated.unfold(1, duration, 1).all(dim=-1)
-                    kernel = batch_x.new_ones(1, 1, duration)
-                    elevated = F.conv_transpose1d(runs.to(batch_x.dtype).unsqueeze(1), kernel).squeeze(1) > 0
-                return elevated.to(batch_x.dtype).mean(dim=1, keepdim=True)
-
-        # Preserve the benign sampler and defense RNG, including head initialization.
-        with torch.random.fork_rng(devices=cuda_devices):
-            torch.random.default_generator.manual_seed(seed)
-            if device.type == "cuda":
-                with torch.cuda.device(device):
-                    torch.cuda.manual_seed(seed)
-            if base_path is not None:
-                base = torch.load(base_path, map_location="cpu", weights_only=True)
-                if "poisoning" in base:
-                    raise ValueError("poison_base_checkpoint_path must be a clean forecasting checkpoint.")
-                model.load_state_dict(base.get("model_state_dict", base), strict=True)
-                print(f"[Poison] Loaded clean forecasting model from {base_path}")
-
-            optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=learning_rate)
-            model.train()
-            for epoch in range(pretrain_epochs):
-                squared_error, elements = 0.0, 0
-                for batch in loader:
-                    optimizer.zero_grad(set_to_none=True)
-                    _, loss, count = forecast_batch(batch)
-                    if not torch.isfinite(loss):
-                        raise RuntimeError("Non-finite loss during clean forecasting warm-up.")
-                    loss.backward()
-                    optimizer.step()
-                    squared_error += loss.item() * count
-                    elements += count
-                print(f"[Poison] Forecast warm-up {epoch + 1}/{pretrain_epochs} "
-                      f"| auxiliary forecast MSE {squared_error / elements:.6f}")
-
-            representation = []
-
-            def capture_representation(module, inputs, output):
-                value = output[0] if isinstance(output, (tuple, list)) else output
-                if not isinstance(value, torch.Tensor) or value.ndim != 3:
-                    raise ValueError("Property representation must have shape [batch, tokens, hidden].")
-                # Do not detach: the property loss must update the forecasting encoder.
-                representation[:] = [value]
-
-            handle = representation_layer.register_forward_hook(capture_representation)
-            property_head = None  # Kept local, never registered on the forecasting model.
-            optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=learning_rate)
-            try:
-                for epoch in range(epochs):
-                    forecast_sum, forecast_elements, property_sum, windows_seen = 0.0, 0, 0.0, 0
-                    label_sum, label_squared_sum = 0.0, 0.0
-                    for batch in loader:
-                        optimizer.zero_grad(set_to_none=True)
-                        representation.clear()
-                        batch_x, forecast_loss, count = forecast_batch(batch)
-                        if not representation:
-                            raise ValueError(f"Representation layer {layer_name!r} was not called during forecasting.")
-                        hidden = representation.pop()
-                        if hidden.shape[0] != batch_x.shape[0]:
-                            raise ValueError("Property representation batch size does not match the inputs.")
-                        if not hidden.requires_grad and property_weight > 0:
-                            raise ValueError("Property representation is detached or frozen; it cannot train the encoder.")
-                        if pooling == "target_token":
-                            if hidden.shape[1] <= channel_index:
-                                raise ValueError("Target channel token is missing from the encoder representation.")
-                            hidden = hidden[:, channel_index, :]
+        history = []
+        try:
+            with torch.random.fork_rng(devices=cuda_devices):
+                torch.random.default_generator.manual_seed(seed)
+                if device.type == "cuda":
+                    with torch.cuda.device(device):
+                        torch.cuda.manual_seed(seed)
+                # Eval mode matches the deterministic client's gradient observation.
+                # eval() does not prevent gradient-based preparation.
+                model.eval()
+                if not load_checkpoint:
+                    projection.weight.requires_grad_(False)
+                    projection.bias.requires_grad_(False)
+                    upstream_parameters = [p for p in model.parameters() if p.requires_grad]
+                    optimizer = torch.optim.Adam(upstream_parameters, lr=lr)
+                    weight_constraints = []
+                    if poison_strategy == "fixed_projection" and rho is not None:
+                        for p in upstream_parameters:
+                            reference = p.detach().clone()
+                            radius = rho * max(reference.norm().item(), 1e-12)
+                            weight_constraints.append((p, reference, radius))
+                    train_loader = loader(preparation, batch_size, shuffle=True)
+                    if poison_strategy == "constant_bias":
+                        stages = [("feature", feature_epochs), ("measurement", measurement_epochs)]
+                    else:
+                        stages = [("measurement", measurement_epochs)]
+                    for stage, epochs in stages:
+                        for epoch in range(epochs):
+                            total, count = 0.0, 0
+                            individual_total, ensemble_total = 0.0, 0.0
+                            for batch in train_loader:
+                                optimizer.zero_grad(set_to_none=True)
+                                _, _, h, phi, s = batch_values(batch)
+                                if multi:
+                                    individual_loss = F.mse_loss(s, phi[:, None].expand_as(s))
+                                    ensemble_loss = F.mse_loss(s.mean(dim=1), phi)
+                                    loss = (1 - ensemble_weight) * individual_loss + ensemble_weight * ensemble_loss
+                                    individual_total += individual_loss.item() * len(phi)
+                                    ensemble_total += ensemble_loss.item() * len(phi)
+                                else:
+                                    prediction = h.mean(dim=1) if stage == "feature" else s
+                                    loss = F.mse_loss(prediction, phi)
+                                if not torch.isfinite(loss):
+                                    raise RuntimeError("Non-finite property preparation loss.")
+                                loss.backward()
+                                optimizer.step()
+                                with torch.no_grad():
+                                    for parameter, reference, radius in weight_constraints:
+                                        if radius == 0:
+                                            parameter.copy_(reference)
+                                        else:
+                                            delta = parameter - reference
+                                            norm = delta.norm().item()
+                                            if norm > radius:
+                                                parameter.copy_(reference + delta * (radius / norm))
+                                total += loss.item() * len(phi)
+                                count += len(phi)
+                            history.append({"stage": stage, "epoch": epoch + 1, "mse": total / count})
+                            loss_details = ""
+                            if multi:
+                                history[-1].update({"individual_mse": individual_total / count,
+                                                    "ensemble_mse": ensemble_total / count})
+                                loss_details = (f" | individual MSE={individual_total / count:.6f}"
+                                                f" | ensemble MSE={ensemble_total / count:.6f}")
+                            print(f"[Poison] {stage} epoch {epoch + 1}/{epochs} | per-window MSE={total / count:.6f}{loss_details}", flush=True)
+                    del optimizer
+                for name, p in model.named_parameters():
+                    p.requires_grad_(original_flags[name])
+                model.zero_grad(set_to_none=True)
+                # The constant baseline uses PREPARATION labels only. No holdout
+                # information is used for training, epoch selection, or baseline fitting.
+                label_sum, label_count = 0.0, 0
+                with torch.no_grad():
+                    for batch in loader(preparation, batch_size):
+                        phi = properties(batch[0].float().to(device))
+                        label_sum += phi.double().sum().item()
+                        label_count += len(phi)
+                constant = label_sum / label_count
+                ordering = torch.randperm(len(holdout), generator=torch.Generator().manual_seed(seed)).tolist()
+                report = {"design": metadata, "checkpoint_source": "loaded" if load_checkpoint else "trained",
+                          "preparation_history": history, "constant_property_baseline": constant,
+                          "validation_batch_sizes": validation_sizes, "validation_seed": seed,
+                          "validation_max_batches": max_validation_batches, "tolerance_fraction": tolerance,
+                          "float32_matmul_precision": torch.get_float32_matmul_precision(),
+                          "raw_gradient_only": True, "results": []}
+                for size in validation_sizes:
+                    n_batches = min(max_validation_batches, len(holdout) // size)
+                    validation = loader(Subset(holdout, ordering[:n_batches * size]), size)
+                    rows = []
+                    for batch_index, batch in enumerate(validation):
+                        model.zero_grad(set_to_none=True)
+                        outputs, targets, h, phi, s = batch_values(batch)
+                        loss = F.mse_loss(outputs, targets, reduction="mean")
+                        loss.backward()  # Actual unchanged client loss, no optimizer step.
+                        named = dict(model.named_parameters())
+                        gradient = named[weight_name].grad
+                        if gradient is None or not torch.isfinite(gradient).all():
+                            raise RuntimeError(f"Missing or non-finite actual client gradient for {weight_name}.")
+                        if multi:
+                            gradients = gradient[row_indices, hidden_indices].detach().cpu().double().numpy()
+                            individual_estimates = (gradients - beta) / alpha
+                            estimate = float(individual_estimates.mean())
+                            residual = outputs.index_select(2, loss_indices) - targets.index_select(2, loss_indices)
+                            contributions = (2.0 / K) * (residual * h).mean(dim=1)
+                            raw_analytics = contributions.mean(dim=0).detach().cpu().double().numpy()
+                            analytics = s.mean(dim=0).detach().cpu().double().numpy()
+                            for q, coordinate in enumerate(coordinates):
+                                if not np.isclose(gradients[q], raw_analytics[q], rtol=1e-4, atol=1e-5):
+                                    raise RuntimeError(f"Raw gradient identity failed at {coordinate}: "
+                                                       f"gradient={gradients[q]}, analytic={raw_analytics[q]}.")
+                                if not np.isclose(individual_estimates[q], analytics[q], rtol=1e-4, atol=1e-5):
+                                    raise RuntimeError(f"Decoded gradient identity failed at {coordinate}: "
+                                                       f"estimate={individual_estimates[q]}, analytic={analytics[q]}.")
                         else:
-                            hidden = hidden.mean(dim=1)
-                        if property_head is None:
-                            property_head = nn.Sequential(
-                                nn.Linear(hidden.shape[-1], hidden_size), nn.ReLU(),
-                                nn.Linear(hidden_size, 1), nn.Sigmoid(),
-                            ).to(device=device, dtype=hidden.dtype)
-                            optimizer.add_param_group({"params": property_head.parameters()})
-                        labels = property_labels(batch_x)
-                        property_loss = F.mse_loss(property_head(hidden), labels)
-                        loss = forecast_loss + property_weight * property_loss
-                        if not torch.isfinite(loss):
-                            raise RuntimeError("Non-finite loss during property-aware poison training.")
-                        loss.backward()
-                        optimizer.step()
-                        forecast_sum += forecast_loss.item() * count
-                        forecast_elements += count
-                        property_sum += property_loss.item() * len(batch_x)
-                        windows_seen += len(batch_x)
-                        label_sum += labels.sum().item()
-                        label_squared_sum += labels.square().sum().item()
-                    label_variance = max(0.0, label_squared_sum / windows_seen - (label_sum / windows_seen) ** 2)
-                    print(f"[Poison] Channel {channels[channel_index]} epoch {epoch + 1}/{epochs} "
-                          f"| forecast MSE {forecast_sum / forecast_elements:.6f} "
-                          f"| property MSE {property_sum / windows_seen:.6f} "
-                          f"| property label std {label_variance ** 0.5:.6f} | weight {property_weight:g}")
-            finally:
-                handle.remove()
-                representation.clear()
-                # No property head, hooks, or optimizer state enters the checkpoint
-                # or changes the parameter ordering used for client gradients.
-                del property_head, optimizer
-
-        model.zero_grad(set_to_none=True)
-        model.eval()
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
-            "model_state_dict": {name: value.detach().cpu() for name, value in model.state_dict().items()},
-            "poisoning": metadata,
-        }, checkpoint_path)
-        config["poison_model_source"] = "trained"
-        print(f"[Poison] Saved channel {channels[channel_index]} model to {checkpoint_path}")
+                            g = gradient[k, j].item()
+                        if poison_strategy == "constant_bias":
+                            estimate = K * g / (2 * C)
+                        elif not multi:
+                            estimate = (g - beta) / alpha
+                            residual = outputs[..., loss_channel] - targets[..., loss_channel]
+                            gradient_contribution = (2.0 / K) * (residual * h).mean(dim=1)
+                            raw_analytic = gradient_contribution.mean().item()
+                            if not np.isclose(g, raw_analytic, rtol=1e-4, atol=1e-5):
+                                raise RuntimeError(f"Raw gradient identity failed: gradient={g}, analytic={raw_analytic}.")
+                        analytic = s.mean().item()
+                        if not np.isclose(estimate, analytic, rtol=1e-4, atol=1e-5):
+                            raise RuntimeError(f"Gradient identity failed for {coordinates}: decoded={estimate}, analytic={analytic}. "
+                                               "On CUDA, retry with torch.set_float32_matmul_precision('highest') "
+                                               "to rule out reduced-precision matrix multiplication.")
+                        truth = phi.mean().item()
+                        rows.append({"batch": batch_index, "estimate": estimate,
+                                     "true_property": truth, "analytic_measurement": analytic,
+                                     "identity_error": abs(estimate - analytic),
+                                     "absolute_error": abs(estimate - truth), "constant_error": abs(constant - truth)})
+                        if multi:
+                            rows[-1].update({"coordinates": coordinates, "gradient_scalars": gradients.tolist(),
+                                             "individual_estimates": individual_estimates.tolist(),
+                                             "raw_analytic_gradients": raw_analytics.tolist(),
+                                             "analytic_measurements": analytics.tolist(),
+                                             "raw_identity_errors": np.abs(gradients - raw_analytics).tolist(),
+                                             "coordinate_identity_errors": np.abs(individual_estimates - analytics).tolist()})
+                            gradient_description = f"gradients={gradients.tolist()}"
+                        else:
+                            rows[-1].update({"gradient_scalar": g, "feature_average": h.mean().item()})
+                            gradient_description = f"gradient={g:.8g}"
+                        if poison_strategy == "constant_bias":
+                            rows[-1]["target_correction"] = (targets[..., loss_channel] * h).mean().item() / C
+                        elif not multi:
+                            rows[-1]["raw_analytic_gradient"] = raw_analytic
+                            rows[-1]["raw_identity_error"] = abs(g - raw_analytic)
+                        print(f"[Poison feasibility] B={size} | batch {batch_index + 1}/{n_batches} "
+                              f"| original property={truth:.6f} | gradient estimate={estimate:.6f} "
+                              f"| estimate - original={estimate - truth:+.6f} "
+                              f"| absolute error={abs(estimate - truth):.6f} | {gradient_description}", flush=True)
+                    errors = np.array([row["estimate"] - row["true_property"] for row in rows])
+                    truths = np.array([row["true_property"] for row in rows])
+                    estimates = np.array([row["estimate"] for row in rows])
+                    baseline_errors = constant - truths
+                    result = {"batch_size": size, "batches": n_batches,
+                              "mae": float(np.abs(errors).mean()), "rmse": float(np.sqrt(np.square(errors).mean())),
+                              "bias": float(errors.mean()), "true_property_std": float(truths.std()),
+                              "estimate_std": float(estimates.std()),
+                              "correlation": (float(np.corrcoef(estimates, truths)[0, 1])
+                                              if estimates.std() > 1e-8 and truths.std() > 1e-8 else None),
+                              "constant_mae": float(np.abs(baseline_errors).mean()),
+                              "constant_rmse": float(np.sqrt(np.square(baseline_errors).mean())),
+                              "max_identity_error": max(row["identity_error"] for row in rows), "rows": rows}
+                    if multi:
+                        coordinate_errors = np.array([row["individual_estimates"] for row in rows]) - truths[:, None]
+                        summaries = []
+                        for q, coordinate in enumerate(coordinates):
+                            error = coordinate_errors[:, q]
+                            summaries.append({"coordinate": coordinate, "mae": float(np.abs(error).mean()),
+                                              "rmse": float(np.sqrt(np.square(error).mean())), "bias": float(error.mean())})
+                        summaries.append({"coordinate": "ensemble", "mae": result["mae"],
+                                          "rmse": result["rmse"], "bias": result["bias"]})
+                        result["coordinate_summary"] = summaries
+                        # Correlate signed ERRORS, not predictions. A constant-error
+                        # coordinate (or fewer than two batches) has undefined correlation.
+                        correlations = [[None for _ in coordinates] for _ in coordinates]
+                        if n_batches >= 2:
+                            for q in range(M):
+                                for r in range(M):
+                                    if np.ptp(coordinate_errors[:, q]) > 0 and np.ptp(coordinate_errors[:, r]) > 0:
+                                        value = float(np.corrcoef(coordinate_errors[:, q], coordinate_errors[:, r])[0, 1])
+                                        correlations[q][r] = value if np.isfinite(value) else None
+                        result["signed_error_correlation"] = {"coordinates": coordinates, "matrix": correlations}
+                    result["beats_constant"] = result["mae"] < result["constant_mae"]
+                    result["within_tolerance"] = result["mae"] <= tolerance
+                    report["results"].append(result)
+                    print(f"[Poison feasibility] B={size} | batches={n_batches} | gradient MAE={result['mae']:.6f} "
+                          f"RMSE={result['rmse']:.6f} | constant MAE={result['constant_mae']:.6f} "
+                          f"| true property std={result['true_property_std']:.6f} "
+                          f"| beats constant={result['beats_constant']} | within {tolerance:g}={result['within_tolerance']} "
+                          f"| max identity error={result['max_identity_error']:.3e}", flush=True)
+                    if result["true_property_std"] < 1e-6:
+                        print("[Poison feasibility] Little/no held-out batch-property variation; low MAE alone is not evidence of informative leakage.", flush=True)
+        finally:
+            handle.remove()
+            captured.clear()
+            for name, p in model.named_parameters():
+                p.requires_grad_(original_flags[name])
+            model.zero_grad(set_to_none=True)
+            model.eval()
+        if poison_strategy == "constant_bias":
+            if torch.count_nonzero(projection.weight[k]).item() or projection.bias[k].item() != projection.bias.new_tensor(C).item():
+                raise RuntimeError("Measurement row or bias changed during preparation/validation.")
+        else:
+            if not torch.equal(projection.weight, projection_reference["weight"]) or not torch.equal(projection.bias, projection_reference["bias"]):
+                raise RuntimeError("Complete projection weight or bias changed during preparation/validation.")
+        if not load_checkpoint:
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint = {"model_state_dict": {name: value.detach().cpu() for name, value in model.state_dict().items()},
+                          "poisoning": metadata}
+            if poison_strategy == "fixed_projection":
+                checkpoint["projection_reference"] = {name: value.cpu() for name, value in projection_reference.items()}
+            torch.save(checkpoint, checkpoint_path)
+        output_dir = Path(config.get("poison_feasibility_output_dir") or Path(__file__).resolve().parents[3] / "evaluation_results")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        report_path = output_dir / f"{checkpoint_path.stem}_feasibility.json"
+        report_path.write_text(json.dumps(report, indent=2) + "\n")
+        parameter_description = f"`{weight_name}` at {coordinates}" if multi else f"`{weight_name}[{k}, {j}]`"
+        lines = [f"# Weights-only property measurement: {config['dataset']} ({poison_strategy})", "",
+                 f"Parameter: {parameter_description}; K={K}, horizon={dataset.pred_len}, {decoding}.", "",
+                 "Raw mean-MSE gradients; estimates are not clipped. This is an auxiliary-data feasibility test, not a guarantee of target-client leakage.", ""]
+        lines += self._poison_feasibility_batch_tables(report)
+        lines += ["## Aggregate diagnostics", "",
+                 "| Batch size | Batches | Gradient MAE | Gradient RMSE | Bias | Constant MAE | Constant RMSE | True property SD | Estimate SD | Correlation | Beats constant | Within tolerance | Max identity error |",
+                 "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---:|"]
+        for row in report["results"]:
+            correlation = "undefined" if row["correlation"] is None else f"{row['correlation']:.6f}"
+            lines.append(f"| {row['batch_size']} | {row['batches']} | {row['mae']:.6f} | {row['rmse']:.6f} | {row['bias']:.6f} "
+                         f"| {row['constant_mae']:.6f} | {row['constant_rmse']:.6f} | {row['true_property_std']:.6f} "
+                         f"| {row['estimate_std']:.6f} | {correlation} "
+                         f"| {row['beats_constant']} | {row['within_tolerance']} | {row['max_identity_error']:.3e} |")
+        tuning_constants = "C" if poison_strategy == "constant_bias" else "alpha or beta"
+        lines += ["", "All error metrics use fractions (multiply by 100 for percentage points). Windows within a partition may overlap; preparation and holdout share no input or target timesteps.",
+                  f"The constant is fitted on preparation labels only. The holdout is used only after training; it is not used to tune {tuning_constants}, choose epochs, or select a checkpoint.", "",
+                  "## Preparation settings", "", "```json", json.dumps(metadata, indent=2), "```", ""]
+        report_path.with_suffix(".md").write_text("\n".join(lines))
+        self.poison_feasibility_results = report
+        config.update({"poison_method": metadata["method"], "poison_strategy": poison_strategy,
+                       "poison_model_source": report["checkpoint_source"],
+                       "poison_checkpoint_path": str(checkpoint_path.resolve()),
+                       "poison_target_channel_name": channels[c], "poison_property_units": units,
+                       "poison_measurement_count": M, "poison_gradient_parameter_name": weight_name,
+                       "poison_gradient_parameter_index": parameter_names.index(weight_name),
+                       "poison_output_channels_in_loss": K,
+                       "poison_loss_elements_per_window": m, "poison_feature_epochs": feature_epochs,
+                       "poison_train_epochs": measurement_epochs,
+                       "poison_feasibility_report": str(report_path.resolve()),
+                       "num_learn_epochs": 0, "load_lti_model": False, "one_shot_targets": False})
+        if multi:
+            for key in ["poison_measurement_channel", "poison_hidden_coordinate", "poison_gradient_coordinate"]:
+                config.pop(key, None)
+        else:
+            config.update({"poison_measurement_channel": channels[k], "poison_hidden_coordinate": j,
+                           "poison_gradient_coordinate": [k, j]})
+        if poison_strategy == "constant_bias":
+            config["poison_measurement_C"] = C
+        else:
+            config.update({"poison_gradient_scale": alpha, "poison_gradient_offset": beta,
+                           "poison_max_relative_weight_change": rho,
+                           "poison_gradient_coordinates": [{"channel": channels[row], "hidden_coordinate": hidden}
+                                                           for row, hidden in coordinates]})
+            if multi:
+                config["poison_ensemble_loss_weight"] = ensemble_weight
+        print(f"[Poison] Feasibility report: {report_path.with_suffix('.md')} | model checkpoint: {checkpoint_path}", flush=True)
         return model
+
+    @staticmethod
+    def _poison_feasibility_batch_tables(report):
+        """Render individual held-out observations before aggregate diagnostics."""
+        multi = "coordinates" in report["design"]
+        if report["design"].get("strategy", "constant_bias") == "fixed_projection":
+            formula = "(gradient - beta) / alpha"
+        else:
+            formula = "K × gradient / (2 × C)"
+        if multi:
+            estimate_description = ("The estimate is the arithmetic mean of the individually decoded gradients: "
+                                    f"mean({formula}), in coordinate order {report['design']['coordinates']}.")
+        else:
+            estimate_description = f"The estimate uses only the selected gradient scalar: {formula}."
+        lines = ["## Held-out batches: original property versus gradient estimate", "",
+                 "Batch size is the number of input windows in one client gradient. Each row below is one separately computed batch gradient.", "",
+                 "The original property is the mean of the exact per-window property values in that batch. "
+                 + estimate_description, "",
+                 "Property values and errors are fractions: 0.25 means 25%; an error of 0.03 means 3 percentage points. "
+                 "A positive signed error means overestimation. Batch numbers start at 1 within each batch size.", ""]
+        for result in report["results"]:
+            gradient_column = "Gradient scalars (coordinate order)" if multi else "Gradient scalar"
+            lines += [f"### Batch size {result['batch_size']}: {len(result['rows'])} held-out batches", "",
+                      f"| Batch | Original property | Gradient estimate | Estimate − original | Absolute error | {gradient_column} |",
+                      "|---:|---:|---:|---:|---:|---:|"]
+            for row in result["rows"]:
+                original, estimate = row["true_property"], row["estimate"]
+                gradient_text = ("[" + ", ".join(f"{g:.8g}" for g in row["gradient_scalars"]) + "]"
+                                 if multi else f"{row['gradient_scalar']:.8g}")
+                lines.append(f"| {row['batch'] + 1} | {original:.6f} | {estimate:.6f} "
+                             f"| {estimate - original:+.6f} | {abs(estimate - original):.6f} "
+                             f"| {gradient_text} |")
+            lines.append("")
+            if multi:
+                lines += ["Individual coordinates and ensemble (errors in property fractions):", "",
+                          "| Coordinate | MAE | RMSE | Signed bias |", "|:---|---:|---:|---:|"]
+                for row in result["coordinate_summary"]:
+                    lines.append(f"| {row['coordinate']} | {row['mae']:.6f} | {row['rmse']:.6f} | {row['bias']:+.6f} |")
+                correlation = result["signed_error_correlation"]
+                labels = [str(q) for q in correlation["coordinates"]]
+                lines += ["", "Pairwise signed estimation-error correlations (undefined when insufficient or constant):", "",
+                          "| Coordinate | " + " | ".join(labels) + " |",
+                          "|:---|" + "---:|" * len(labels)]
+                for label, values in zip(labels, correlation["matrix"]):
+                    cells = ["undefined" if value is None else f"{value:.6f}" for value in values]
+                    lines.append(f"| {label} | " + " | ".join(cells) + " |")
+                lines += ["", "Averaging is not assumed to improve accuracy; compare the individual and ensemble errors above.", ""]
+        return lines
 
     def _property_percentile_attack_loader(self, tr_dataloader, config):
         """Select full candidate batches by their mean target-channel property.
