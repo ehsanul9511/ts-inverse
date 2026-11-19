@@ -25,3 +25,6 @@ dependencies = [
     "seaborn",
     "torch",
 ]
+
+[project.optional-dependencies]
+flame = ["hdbscan"]

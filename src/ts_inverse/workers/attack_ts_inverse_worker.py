@@ -205,6 +205,8 @@ class AttackTSInverseWorker(Worker):
         return model, train_dataloader, final_config
 
     def worker_process(self, c, d_c, m_c, fam_c, def_c):
+        if c.get("fl_poisoning_enabled", False) and c.get("poison_feasibility_only", False):
+            raise ValueError("FL poisoning does not support poison_feasibility_only=True; disable it before training.")
         model, train_dataloader, final_config = self._init_attack_worker_process(c, d_c, m_c, fam_c, def_c)
         print("Initialized attack worker process")
         self._uses_direct_property_inference(final_config)
@@ -670,6 +672,8 @@ class AttackTSInverseWorker(Worker):
 
     @staticmethod
     def _uses_direct_property_inference(config):
+        if config.get("fl_poisoning_enabled", False) and config.get("poison_feasibility_only", False):
+            raise ValueError("FL poisoning does not support poison_feasibility_only=True.")
         mode = config.get("attack_mode", "gradient_inversion")
         if mode not in {"gradient_inversion", "poisoning_assisted_property_inference", "both"}:
             raise ValueError("attack_mode must be gradient_inversion, poisoning_assisted_property_inference, or both.")
@@ -677,8 +681,8 @@ class AttackTSInverseWorker(Worker):
         if mode == "both" and config.get("num_attack_steps", 0) <= 0:
             raise ValueError("attack_mode=both requires num_attack_steps > 0 to generate a reconstruction.")
         if direct:
-            if not config.get("poison_global_model", False) or config.get("dataset") not in ETT_DATASETS:
-                raise ValueError("Direct property inference requires poison_global_model=True and an ETT dataset.")
+            if not (config.get("poison_global_model", False) or config.get("fl_poisoning_enabled", False)) or config.get("dataset") not in ETT_DATASETS:
+                raise ValueError("Direct property inference requires centralized or FL poisoning and an ETT dataset.")
             if config.get("poison_feasibility_only", False):
                 raise ValueError("Set poison_feasibility_only=False to evaluate recorded client gradients.")
             if config.get("update_model", False) or config.get("defense_name", "none") not in {None, "none"}:
@@ -727,6 +731,15 @@ class AttackTSInverseWorker(Worker):
             raise ValueError(f"Unsupported poison strategy {strategy!r}.")
         if config.get("poison_strategy", strategy) != strategy:
             raise ValueError("Poison strategy differs from the prepared model.")
+        return self._evaluate_property_observation(
+            model, design, preparation["constant_property_baseline"], batch_number, original_dy_dx,
+            batch_inputs, batch_targets, self.all_batch_input_marks[batch_number], self.all_batch_target_marks[batch_number])
+
+    def _evaluate_property_observation(self, model, design, baseline, batch_number, original_dy_dx,
+                                       batch_inputs, batch_targets, input_marks, target_marks):
+        """Read-only decoding and analytical verification of an ordinary observed MSE gradient."""
+        from pi_eval.property_inference import run_fractions
+        strategy = design.get("strategy", "constant_bias")
         coordinates = design.get("coordinates", [design.get("coordinate")])
         names = [name for name, p in model.named_parameters() if p.requires_grad]
         name = design["weight_name"]
@@ -757,8 +770,8 @@ class AttackTSInverseWorker(Worker):
                 y = batch_targets.to(device=weight.device, dtype=weight.dtype)
                 horizon, history = design["pred_len"], design["label_len"]
                 decoder = torch.cat([x[:, x.shape[1] - history:], x.new_zeros(len(x), horizon, x.shape[2])], dim=1)
-                output = model(x, self.all_batch_input_marks[batch_number].to(weight.device), decoder,
-                               self.all_batch_target_marks[batch_number].to(weight.device))
+                output = model(x, input_marks.to(weight.device), decoder,
+                               target_marks.to(weight.device))
                 output = output[0] if isinstance(output, (tuple, list)) else output
                 if len(captured) != 1:
                     raise ValueError("Expected one final projection invocation for client evaluation.")
@@ -805,7 +818,7 @@ class AttackTSInverseWorker(Worker):
         row = {"batch": batch_number, "batch_size": len(batch_inputs), "estimate": estimate,
                "true_property": truth, "per_window_true_property": phi.tolist(),
                "signed_error": estimate - truth, "absolute_error": abs(estimate - truth),
-               "constant_error": abs(preparation["constant_property_baseline"] - truth),
+               "constant_error": abs(baseline - truth),
                "measurements": details,
                "identity_error": max(d["identity_error"] for d in details)}
         if len(coordinates) > 1:
@@ -1952,15 +1965,75 @@ class AttackTSInverseWorker(Worker):
 
         return all_dummy_inputs, all_dummy_targets
 
-    def load_or_train_poisoned_global_model(self, model, config):
-        """Train an existing projection coordinate as a property measurement.
-
-        No model architecture or client loss changes. constant_bias zeros a
-        projection row and sets its bias to C; fixed_projection preserves the
-        entire projection and learns the actual residual-times-feature measurement.
-        Always validate actual raw mean-MSE gradients on a purged temporal holdout.
-        """
+    @staticmethod
+    def _property_labels(x, design):
         from pi_eval.property_inference import run_fractions
+        with torch.no_grad():
+            c = design["property_channel"]
+            values = x[..., c]
+            if design["threshold_units"] == "physical" and design["scale"]:
+                values = values * design["scaler_scale"][c] + design["scaler_mean"][c]
+            if not torch.isfinite(values).all():
+                raise ValueError("Non-finite property inputs.")
+            scores = run_fractions((values > design["threshold"]).detach().cpu().numpy(), design["duration"])
+            return torch.as_tensor(scores, device=x.device, dtype=x.dtype)
+
+    def _property_measurement_batch(self, model, batch, setup, captured):
+        projection = setup["projection"]
+        channels = setup["channels"]
+        dataset = setup["dataset"]
+        mode = setup["mode"]
+        multi = setup["multi"]
+        j = setup["j"]
+        k = setup["k"]
+        poison_strategy = setup["poison_strategy"]
+        C = setup["C"]
+        alpha = setup["alpha"]
+        beta = setup["beta"]
+        K = 1 if mode == "MS" else len(channels)
+        m = dataset.pred_len * K
+        loss_channel = 0 if mode == "MS" else k
+        if multi:
+            hidden_indices = torch.tensor([q[1] for q in setup["coordinates"]], device=projection.weight.device)
+            loss_indices = torch.tensor([0 if mode == "MS" else q[0] for q in setup["coordinates"]], device=projection.weight.device)
+        x, y, xm, ym = (value.float().to(projection.weight.device) for value in batch)
+        if x.shape[-1] != len(channels):
+            raise ValueError("Input channel ordering/shape does not match the configured ETT dataset.")
+        decoder = torch.cat([y[:, :dataset.label_len], torch.zeros_like(y[:, -dataset.pred_len:])], dim=1)
+        captured.clear()
+        output = model(x, xm, decoder, ym)
+        output = output[0] if isinstance(output, (tuple, list)) else output
+        if not captured or captured[0].ndim != 3:
+            raise ValueError("Expected [batch, horizon, hidden] activation before the final projection.")
+        projection_input = captured.pop()
+        hidden = projection_input[:, -dataset.pred_len:]
+        raw_output = output[:, -dataset.pred_len:]
+        # Reject normalization, nonlinearities or other processing after the
+        # projection: the raw linear identity must match the actual client.
+        linear_output = F.linear(projection_input, projection.weight, projection.bias)[:, -dataset.pred_len:]
+        if raw_output.shape != linear_output.shape or not torch.allclose(raw_output, linear_output, rtol=1e-5, atol=1e-6):
+            raise ValueError("The configured projection is not the raw final forecast layer; measurement identity is unsupported.")
+        f_dim = -1 if mode == "MS" else 0
+        output, targets = raw_output[..., f_dim:], y[:, -dataset.pred_len:, f_dim:]
+        if output.shape != targets.shape or output[0].numel() != m:
+            raise ValueError("Forecast/target slicing does not match mean-MSE measurement coordinates.")
+        h = hidden.index_select(2, hidden_indices) if multi else hidden[..., j]
+        phi = self._property_labels(x, setup["metadata"])
+        if poison_strategy == "constant_bias":
+            s = ((1 - targets[..., loss_channel] / C) * h).mean(dim=1)
+        else:
+            if multi:
+                residual = output.index_select(2, loss_indices) - targets.index_select(2, loss_indices)
+            else:
+                residual = output[..., loss_channel] - targets[..., loss_channel]
+            gradient_contribution = (2.0 / K) * (residual * h).mean(dim=1)
+            s = (gradient_contribution - beta) / alpha
+        return output, targets, h, phi, s
+
+
+    def _prepare_property_measurement(self, model, config):
+        """Validate a measurement and construct purged auxiliary subsets; never train/load weights."""
+        C = alpha = beta = rho = ensemble_weight = None
 
         poison_strategy = config.get("poison_strategy", "fixed_projection")
         if poison_strategy not in {"constant_bias", "fixed_projection"}:
@@ -2156,6 +2229,84 @@ class AttackTSInverseWorker(Worker):
                 metadata.update({"method": "weights_only_fixed_projection_multi_measurement_v1",
                                  "coordinates": coordinates, "ensemble_loss_weight": ensemble_weight,
                                  "aggregation": "arithmetic_mean"})
+        return {
+            "metadata": metadata,
+            "decoding": decoding,
+            "projection": projection,
+            "poison_strategy": poison_strategy,
+            "C": C,
+            "alpha": alpha,
+            "beta": beta,
+            "rho": rho,
+            "ensemble_weight": ensemble_weight,
+            "c": c,
+            "k": k,
+            "j": j,
+            "channels": channels,
+            "units": units,
+            "feature_epochs": feature_epochs,
+            "measurement_epochs": measurement_epochs,
+            "batch_size": batch_size,
+            "lr": lr,
+            "seed": seed,
+            "tolerance": tolerance,
+            "max_validation_batches": max_validation_batches,
+            "validation_sizes": validation_sizes,
+            "preparation": preparation,
+            "holdout": holdout,
+            "dataset": dataset,
+            "mode": mode,
+            "multi": multi,
+            "M": M,
+            "coordinates": coordinates,
+            "base_path": base_path,
+            "weight_name": weight_name,
+            "parameter_names": parameter_names,
+        }
+
+    def load_or_train_poisoned_global_model(self, model, config):
+        """Train an existing projection coordinate as a property measurement.
+
+        No model architecture or client loss changes. constant_bias zeros a
+        projection row and sets its bias to C; fixed_projection preserves the
+        entire projection and learns the actual residual-times-feature measurement.
+        Always validate actual raw mean-MSE gradients on a purged temporal holdout.
+        This is centralized preparation; fl_aggregation selects the separate
+        run_federated_training path, not this checkpoint-training path.
+        """
+        setup = self._prepare_property_measurement(model, config)
+        metadata = setup["metadata"]
+        decoding = setup["decoding"]
+        projection = setup["projection"]
+        poison_strategy = setup["poison_strategy"]
+        C = setup["C"]
+        alpha = setup["alpha"]
+        beta = setup["beta"]
+        rho = setup["rho"]
+        ensemble_weight = setup["ensemble_weight"]
+        c = setup["c"]
+        k = setup["k"]
+        j = setup["j"]
+        channels = setup["channels"]
+        units = setup["units"]
+        feature_epochs = setup["feature_epochs"]
+        measurement_epochs = setup["measurement_epochs"]
+        batch_size = setup["batch_size"]
+        lr = setup["lr"]
+        seed = setup["seed"]
+        tolerance = setup["tolerance"]
+        max_validation_batches = setup["max_validation_batches"]
+        validation_sizes = setup["validation_sizes"]
+        preparation = setup["preparation"]
+        holdout = setup["holdout"]
+        dataset = setup["dataset"]
+        mode = setup["mode"]
+        multi = setup["multi"]
+        M = setup["M"]
+        coordinates = setup["coordinates"]
+        base_path = setup["base_path"]
+        weight_name = setup["weight_name"]
+        parameter_names = setup["parameter_names"]
         digest = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()[:16]
         checkpoint_path = Path(config.get("poison_checkpoint_path") or (
             Path(__file__).resolve().parents[3] / "models" / "poisoned_global"
@@ -2200,12 +2351,7 @@ class AttackTSInverseWorker(Worker):
                               generator=torch.Generator().manual_seed(seed))
 
         def properties(x):
-            with torch.no_grad():
-                values = x[..., c] * property_scale + property_mean
-                if not torch.isfinite(values).all():
-                    raise ValueError("Non-finite auxiliary property inputs.")
-                scores = run_fractions((values > tau).detach().cpu().numpy(), duration)
-                return torch.as_tensor(scores, device=x.device, dtype=x.dtype)
+            return self._property_labels(x, metadata)
 
         captured = []
 
@@ -2223,39 +2369,7 @@ class AttackTSInverseWorker(Worker):
             loss_indices = torch.zeros_like(row_indices) if mode == "MS" else row_indices
 
         def batch_values(batch):
-            x, y, xm, ym = (value.float().to(config["device"]) for value in batch)
-            if x.shape[-1] != len(channels):
-                raise ValueError("Input channel ordering/shape does not match the configured ETT dataset.")
-            decoder = torch.cat([y[:, :dataset.label_len], torch.zeros_like(y[:, -dataset.pred_len:])], dim=1)
-            captured.clear()
-            output = model(x, xm, decoder, ym)
-            output = output[0] if isinstance(output, (tuple, list)) else output
-            if not captured or captured[0].ndim != 3:
-                raise ValueError("Expected [batch, horizon, hidden] activation before the final projection.")
-            projection_input = captured.pop()
-            hidden = projection_input[:, -dataset.pred_len:]
-            raw_output = output[:, -dataset.pred_len:]
-            # Reject normalization, nonlinearities or other processing after the
-            # projection: the raw linear identity must match the actual client.
-            linear_output = F.linear(projection_input, projection.weight, projection.bias)[:, -dataset.pred_len:]
-            if raw_output.shape != linear_output.shape or not torch.allclose(raw_output, linear_output, rtol=1e-5, atol=1e-6):
-                raise ValueError("The configured projection is not the raw final forecast layer; measurement identity is unsupported.")
-            f_dim = -1 if mode == "MS" else 0
-            output, targets = raw_output[..., f_dim:], y[:, -dataset.pred_len:, f_dim:]
-            if output.shape != targets.shape or output[0].numel() != m:
-                raise ValueError("Forecast/target slicing does not match mean-MSE measurement coordinates.")
-            h = hidden.index_select(2, hidden_indices) if multi else hidden[..., j]
-            phi = properties(x)
-            if poison_strategy == "constant_bias":
-                s = ((1 - targets[..., loss_channel] / C) * h).mean(dim=1)
-            else:
-                if multi:
-                    residual = output.index_select(2, loss_indices) - targets.index_select(2, loss_indices)
-                else:
-                    residual = output[..., loss_channel] - targets[..., loss_channel]
-                gradient_contribution = (2.0 / K) * (residual * h).mean(dim=1)
-                s = (gradient_contribution - beta) / alpha
-            return output, targets, h, phi, s
+            return self._property_measurement_batch(model, batch, setup, captured)
 
         device = torch.device(config["device"])
         cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
@@ -2711,7 +2825,396 @@ class AttackTSInverseWorker(Worker):
             collate_fn=tr_dataloader.collate_fn, generator=torch.Generator().manual_seed(seed),
         )
 
+    def run_federated_training(self, model, model_train_loader, model_val_loader, config,
+                               num_rounds, malicious_poisoning=False):
+        """Shared-loader FL with FedAvg or attachment-style FLAME on model deltas.
+
+        Model states are submissions. Subsequent ordinary client gradients are
+        separately observed; model deltas are never decoded as gradients.
+        """
+        if config.get('fl_training_defense', 'none') not in {None, 'none'}:
+            raise ValueError('FedAvg training defenses are unsupported; fl_training_defense must be none. Recorded-gradient defenses remain separate.')
+        aggregation = config.get('fl_aggregation', 'fedavg')
+        if aggregation not in {'fedavg', 'flame'}:
+            raise ValueError('fl_aggregation must be fedavg or flame.')
+        aggregation_label = 'FedAvg' if aggregation == 'fedavg' else 'FLAME'
+        flame_sigma = config.get('flame_sigma', 0.0001)
+        if aggregation == 'flame':
+            if not np.isfinite(flame_sigma) or flame_sigma < 0:
+                raise ValueError('flame_sigma must be finite and nonnegative.')
+            try:
+                import hdbscan
+                from sklearn.metrics.pairwise import cosine_distances
+            except ImportError as exc:
+                raise ImportError('FLAME requires hdbscan and scikit-learn; install ts-inverse[flame].') from exc
+        clients = config.get('num_clients', 10)
+        steps, lr = config.get('local_steps', 1), config.get('local_lr', 1e-3)
+        if type(clients) is not int or clients < 1 or type(num_rounds) is not int or num_rounds < 0:
+            raise ValueError('Use positive num_clients and nonnegative integer model_train_epochs.')
+        if type(steps) is not int or steps < 1 or not np.isfinite(lr) or lr <= 0:
+            raise ValueError('Use positive local_steps and finite positive local_lr.')
+        if aggregation == 'flame' and clients < 2:
+            raise ValueError('FLAME requires at least two clients.')
+        device = next(model.parameters()).device
+        dataset = self.train_datasets[0]
+        pred_len, label_len = dataset.pred_len, dataset.label_len
+        f_dim = -1 if dataset.features == 'MS' else 0
+        names = [name for name, p in model.named_parameters() if p.requires_grad]
+        flags = {name: p.requires_grad for name, p in model.named_parameters()}
+        print(f'[{aggregation_label}] Shared-loader simulation; no server optimizer. '
+              f'Aggregation={aggregation}; recorded-gradient defense={config.get("defense_name", "none")}.', flush=True)
+
+        def flame_weights(submissions, start):
+            # Match the supplied implementation's normalized clipping weights,
+            # using model deltas (the FL payload here), not observed gradients.
+            flat = np.stack([
+                torch.cat([(state[name] - start[name]).reshape(-1).double().cpu()
+                           for name in names]).numpy()
+                for state in submissions
+            ])
+            distances = cosine_distances(flat).astype(np.float64)
+            labels = hdbscan.HDBSCAN(
+                min_cluster_size=clients // 2 + 1, min_samples=1,
+                allow_single_cluster=True, metric='precomputed',
+            ).fit_predict(distances)
+            norms = np.linalg.norm(flat, axis=1) + 1e-12
+            median_norm = float(np.median(norms))
+            clip_factors = np.minimum(1., median_norm / norms)
+            weights = np.where(labels != -1, clip_factors, 0.)
+            fallback = bool(weights.sum() <= 0)
+            if fallback:
+                weights = np.ones(clients) / clients
+            else:
+                weights /= weights.sum()
+            # Deliberately retain the attachment's squared noise multiplier.
+            noise_std = float((flame_sigma * median_norm) ** 2)
+            diagnostics = {'cluster_labels': labels.tolist(), 'update_norms': norms.tolist(),
+                           'median_norm': median_norm, 'clip_factors': clip_factors.tolist(),
+                           'all_rejected_fallback': fallback, 'noise_std': noise_std,
+                           'accepted_client_ids': np.flatnonzero(weights > 0).tolist()}
+            return weights.tolist(), diagnostics
+
+        def forward_loss(local, batch):
+            x, y, xm, ym = (v.float().to(device) for v in batch)
+            decoder = torch.cat([y[:, :label_len], torch.zeros_like(y[:, -pred_len:])], dim=1)
+            output = local(x, xm, decoder, ym)
+            output = output[0] if isinstance(output, (tuple, list)) else output
+            output, target = output[:, -pred_len:, f_dim:], y[:, -pred_len:, f_dim:]
+            if output.shape != target.shape:
+                raise ValueError('ETT forecast and target shapes differ in FedAvg.')
+            return F.mse_loss(output, target), target.numel()
+
+        def checked_gradients(local):
+            for name, p in local.named_parameters():
+                if p.requires_grad and (p.grad is None or not torch.isfinite(p.grad).all()):
+                    raise RuntimeError(f'Missing or non-finite local gradient for {name!r}.')
+
+        malicious_ids = set()
+        report = {'preparation_origin': f'shared_loader_{aggregation}', 'aggregation': aggregation,
+                  'flame_sigma': flame_sigma if aggregation == 'flame' else None, 'training_defense': 'none',
+                  'recorded_gradient_defense': config.get('defense_name', 'none'), 'rounds': []}
+        if malicious_poisoning:
+            if config.get('poison_feasibility_only', False):
+                raise ValueError('FL poisoning does not support poison_feasibility_only=True.')
+            if config.get('poison_strategy', 'fixed_projection') != 'fixed_projection':
+                raise ValueError('FL poisoning supports fixed_projection only; constant_bias remains centralized.')
+            if config.get('poison_base_checkpoint_path') or config.get('poison_checkpoint_path'):
+                raise ValueError('FL poisoning does not load centralized base/poison checkpoints; remove checkpoint paths.')
+            fraction = config.get('fl_malicious_fraction', .1)
+            if not np.isfinite(fraction) or not 0 < fraction < 1:
+                raise ValueError('fl_malicious_fraction must be finite and strictly between 0 and 1.')
+            count = int(np.ceil(clients * fraction))
+            if not 1 <= count < clients:
+                raise ValueError('FL poisoning needs at least one malicious and one honest client.')
+            seed = config.get('fl_poison_seed', config.get('seed', 0))
+            malicious_ids = set(np.random.default_rng(seed).choice(clients, count, replace=False).tolist())
+            poison_steps = config.get('fl_poison_local_steps', config.get('local_steps', 1))
+            poison_optimizer = config.get('fl_poison_optimizer', 'sgd')
+            poison_start_round = config.get('fl_poison_start_round', 1)
+            if poison_optimizer not in {'sgd', 'adam'}:
+                raise ValueError('fl_poison_optimizer must be sgd or adam.')
+            if type(poison_start_round) is not int or poison_start_round < 1:
+                raise ValueError('fl_poison_start_round must be a positive integer (rounds start at 1).')
+            poison_lr = config.get('fl_poison_learning_rate', config.get('poison_train_learning_rate', config.get('local_lr', 1e-3)))
+            poison_size = config.get('fl_poison_batch_size', config.get('poison_train_batch_size', config.get('model_train_batch_size', 32)))
+            eval_batches = config.get('fl_poison_eval_batches', config.get('poison_validation_batches', 8))
+            if any(type(n) is not int or n < 1 for n in [poison_steps, poison_size, eval_batches]) or not np.isfinite(poison_lr) or poison_lr <= 0:
+                raise ValueError('FL poison steps/batch sizes/evaluation batches and learning rate must be positive.')
+            channel_names = ([dataset.target] if dataset.features == 'S' else list(pd.read_csv(Path(dataset.root_path) / dataset.data_path, nrows=0).columns[1:]))
+            setup_config = dict(config)
+            setup_config.setdefault('seed', 0)
+            setup_config.setdefault('device', str(device))
+            setup_config.setdefault('poison_target_channel', 'HUFL' if 'HUFL' in channel_names else channel_names[0])
+            # This is validation/subset construction only, never centralized preparation.
+            setup_config.update(poison_feasibility_only=True, poison_train_batch_size=poison_size,
+                                poison_train_learning_rate=poison_lr, poison_seed=seed,
+                                poison_feature_epochs=0, poison_train_epochs=1)
+            setup = self._prepare_property_measurement(model, setup_config)
+            design = dict(setup['metadata'], preparation_origin=f'malicious_client_{aggregation}', fl_aggregation=aggregation,
+                          method='fl_fixed_projection_measurement_v1')
+            design.update(fl_malicious_fraction=fraction, malicious_client_ids=sorted(malicious_ids),
+                          fl_poison_local_steps=poison_steps, fl_poison_learning_rate=poison_lr,
+                          fl_poison_optimizer=poison_optimizer, fl_poison_start_round=poison_start_round,
+                          training_stages=[["local_property_steps", poison_steps]])
+            for key in ['feature_epochs', 'measurement_epochs']:
+                design.pop(key, None)
+            setup['metadata'] = design
+            auxiliary = DataLoader(setup['preparation'], batch_size=poison_size, shuffle=True,
+                                   generator=torch.Generator().manual_seed(seed))
+            auxiliary_iterator = iter(auxiliary)
+            holdout = DataLoader(setup['holdout'], batch_size=poison_size, shuffle=True,
+                                 generator=torch.Generator().manual_seed(seed))
+            # Fixed holdout batches, never consumed by local training.
+            evaluation_batches = []
+            for batch in holdout:
+                evaluation_batches.append(batch)
+                if len(evaluation_batches) >= eval_batches:
+                    break
+            baseline_loader = DataLoader(setup['preparation'], batch_size=poison_size,
+                                         generator=torch.Generator().manual_seed(seed))
+            labels = [self._property_labels(batch[0].float(), design).double() for batch in baseline_loader]
+            baseline = torch.cat(labels).mean().item()
+            config.update(poison_method=design['method'], poison_strategy='fixed_projection',
+                          poison_gradient_parameter_name=design['weight_name'],
+                          poison_gradient_parameter_index=names.index(design['weight_name']),
+                          poison_output_channels_in_loss=1 if dataset.features == 'MS' else len(channel_names),
+                          preparation_origin=f'malicious_client_{aggregation}', fl_aggregation=aggregation)
+            report.update(design=design, requested_malicious_fraction=fraction, malicious_count=count,
+                          realized_malicious_fraction=count / clients, malicious_client_ids=sorted(malicious_ids),
+                          constant_property_baseline=baseline)
+            evaluator_client = min(malicious_ids)
+            report.update(evaluator_client_id=evaluator_client, requested_rounds=num_rounds)
+            root = Path(config.get('property_inference_output_dir') or Path(__file__).resolve().parents[3] / 'evaluation_results')
+            root.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(ZoneInfo('America/New_York')).strftime('%Y%m%d_%H%M%S_%f%z')
+            path = root / f'{config.get("dataset", "ETT")}_fedavg_{stamp}.json'
+            config['fl_poison_report'] = str(path)
+            print(f'[{aggregation_label} poison] requested fraction={fraction:g}, count={count}/{clients}, realized={count / clients:g}, IDs={sorted(malicious_ids)}', flush=True)
+            print(f'[{aggregation_label} poison] local optimizer={poison_optimizer}; starts at round {poison_start_round}. '
+                  'Before that, all clients use honest forecasting SGD. Local optimizer state resets for each client each round.', flush=True)
+
+        def evaluate_property(round_index):
+            # One designated malicious client observes ordinary MSE gradients on
+            # its held-out auxiliary data using a fresh copy of the global model.
+            # This copy is never trained or submitted to aggregation.
+            evaluation_model = deepcopy(model)
+            evaluation_model.eval()
+            observations = []
+            print(f'[{aggregation_label} property] round={round_index}/{num_rounds} evaluator_client={evaluator_client} '
+                  f'held-out batches={len(evaluation_batches)}; ordinary mean-MSE gradients, no local updates.', flush=True)
+            for batch_number, batch in enumerate(evaluation_batches):
+                loss, _ = forward_loss(evaluation_model, batch)
+                gradients = torch.autograd.grad(loss, [p for p in evaluation_model.parameters() if p.requires_grad])
+                x, y, xm, ym = (v.float().to(device) for v in batch)
+                observations.append(self._evaluate_property_observation(
+                    evaluation_model, design, baseline, batch_number, gradients, x, y[:, -pred_len:, f_dim:], xm, ym))
+            errors = np.array([r['signed_error'] for r in observations])
+            coordinates = design.get('coordinates', [design.get('coordinate')])
+            per_coordinate = []
+            for q, coordinate in enumerate(coordinates):
+                e = np.array([r['measurements'][q]['signed_error'] for r in observations])
+                per_coordinate.append({'coordinate': coordinate, 'mae': float(np.abs(e).mean()),
+                                       'rmse': float(np.sqrt(np.square(e).mean())), 'bias': float(e.mean())})
+            return {'round': round_index, 'evaluator_client_id': evaluator_client,
+                    'mae': float(np.abs(errors).mean()), 'rmse': float(np.sqrt(np.square(errors).mean())),
+                    'beats_constant': float(np.abs(errors).mean()) < float(np.mean([r['constant_error'] for r in observations])),
+                    'constant_mae': float(np.mean([r['constant_error'] for r in observations])),
+                    'coordinate_errors': per_coordinate, 'rows': observations}
+
+        if malicious_poisoning:
+            report['initial_property_evaluation'] = evaluate_property(0)
+            path.write_text(json.dumps(report, indent=2) + '\n')
+        iterator = iter(model_train_loader)
+        for round_number in range(num_rounds):
+            poison_active = malicious_poisoning and round_number + 1 >= poison_start_round
+            start = {name: value.detach().clone() for name, value in model.state_dict().items()}
+            submissions, sizes, honest_losses, poison_losses = [], [], [], []
+            for client in range(clients):
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    iterator = iter(model_train_loader)
+                    batch = next(iterator)
+                sizes.append(len(batch[0]))  # Auxiliary volume and repeated steps never affect weight.
+                local = deepcopy(model)
+                local.load_state_dict(start, strict=True)
+                if [name for name, p in local.named_parameters() if p.requires_grad] != names:
+                    raise ValueError('Client trainable parameter ordering differs from global model.')
+                if poison_active and client in malicious_ids:
+                    local.eval()
+                    projection = dict(local.named_modules())[design['weight_name'].rsplit('.', 1)[0]]
+                    reference = {name: value.detach().clone() for name, value in projection.state_dict().items()}
+                    captured = []
+                    handle = projection.register_forward_pre_hook(lambda module, args: captured.append(args[0]))
+                    try:
+                        projection.weight.requires_grad_(False)
+                        projection.bias.requires_grad_(False)
+                        parameters = [p for p in local.parameters() if p.requires_grad]
+                        if poison_optimizer == 'adam':
+                            local_optimizer = torch.optim.Adam(parameters, lr=poison_lr)
+                        else:
+                            local_optimizer = torch.optim.SGD(parameters, lr=poison_lr)
+                        local_setup = dict(setup, projection=projection)
+                        budget = setup['rho']
+                        constraints = [(p, p.detach().clone(), budget * max(p.norm().item(), 1e-12)) for p in parameters] if budget is not None else []
+                        for _ in range(poison_steps):
+                            try:
+                                poison_batch = next(auxiliary_iterator)
+                            except StopIteration:
+                                auxiliary_iterator = iter(auxiliary)
+                                poison_batch = next(auxiliary_iterator)
+                            local_optimizer.zero_grad(set_to_none=True)
+                            _, _, _, phi, s = self._property_measurement_batch(local, poison_batch, local_setup, captured)
+                            if setup['multi']:
+                                loss = ((1 - setup['ensemble_weight']) * F.mse_loss(s, phi[:, None].expand_as(s))
+                                        + setup['ensemble_weight'] * F.mse_loss(s.mean(1), phi))
+                            else:
+                                loss = F.mse_loss(s, phi)
+                            if not torch.isfinite(loss):
+                                raise RuntimeError('Non-finite malicious local objective.')
+                            loss.backward()
+                            checked_gradients(local)
+                            local_optimizer.step()
+                            with torch.no_grad():
+                                for p, center, radius in constraints:
+                                    delta = p - center
+                                    norm = delta.norm().item()
+                                    if radius == 0:
+                                        p.copy_(center)
+                                    elif norm > radius:
+                                        p.copy_(center + delta * (radius / norm))
+                            poison_losses.append(loss.item())
+                        if any(not torch.equal(value, reference[name]) for name, value in projection.state_dict().items()):
+                            raise RuntimeError('Malicious local projection changed.')
+                    finally:
+                        handle.remove()
+                        captured.clear()
+                        for name, p in local.named_parameters():
+                            p.requires_grad_(flags[name])
+                else:
+                    local.train()
+                    local_optimizer = torch.optim.SGD(local.parameters(), lr=lr)
+                    for _ in range(steps):
+                        local_optimizer.zero_grad(set_to_none=True)
+                        loss, _ = forward_loss(local, batch)
+                        loss.backward()
+                        checked_gradients(local)
+                        local_optimizer.step()
+                    honest_losses.append(loss.item())
+                submission = {name: value.detach().clone() for name, value in local.state_dict().items()}
+                if submission.keys() != start.keys():
+                    raise ValueError('Client state names differ from round-start state.')
+                for name, value in submission.items():
+                    if value.shape != start[name].shape or value.dtype != start[name].dtype or not torch.isfinite(value).all():
+                        raise ValueError(f'Invalid FedAvg state entry {name!r}.')
+                    if name not in names and not torch.equal(value, start[name]):
+                        raise ValueError(f'Unsupported mutable buffer/frozen parameter {name!r}; no aggregation policy defined.')
+                    if name in names and not value.is_floating_point():
+                        raise ValueError(f'FedAvg requires floating trainable parameter {name!r}.')
+                submissions.append(submission)
+                if config.get('debug_fl', False):
+                    print(f'[{aggregation_label} debug] round={round_number + 1} client={client} assigned_size={sizes[-1]} poisoning={poison_active and client in malicious_ids}')
+            if any(size <= 0 for size in sizes):
+                raise ValueError('FedAvg assigned client batches must be nonempty.')
+            if aggregation == 'fedavg':
+                weights = [size / sum(sizes) for size in sizes]
+            else:
+                weights, flame_diagnostics = flame_weights(submissions, start)
+                # Before the poisoning start round, selected clients train honestly.
+                malicious_weights = [{'client_id': client, 'weight': weights[client]}
+                                     for client in sorted(malicious_ids) if poison_active]
+                malicious_accepted = sum(entry['weight'] > 0 for entry in malicious_weights)
+                malicious_weight_total = sum(entry['weight'] for entry in malicious_weights)
+                flame_diagnostics.update(malicious_update_weights=malicious_weights,
+                                         malicious_updates_aggregated=malicious_accepted,
+                                         malicious_aggregation_weight=malicious_weight_total)
+                print(f'[FLAME] round={round_number + 1}/{num_rounds} '
+                      f'accepted={flame_diagnostics["accepted_client_ids"]} '
+                      f'malicious_aggregated={malicious_accepted}/{len(malicious_weights)} '
+                      f'malicious_weights={malicious_weights} '
+                      f'malicious_total_weight={malicious_weight_total:.6g} '
+                      f'fallback={flame_diagnostics["all_rejected_fallback"]} '
+                      f'median_norm={flame_diagnostics["median_norm"]:.6g} '
+                      f'noise_std={flame_diagnostics["noise_std"]:.6g}', flush=True)
+            with torch.no_grad():
+                averaged = dict(start)
+                for name in names:
+                    if aggregation == 'fedavg':
+                        averaged[name] = sum(submission[name] * weight for submission, weight in zip(submissions, weights))
+                    else:
+                        delta = sum((state[name] - start[name]) * weight
+                                    for state, weight in zip(submissions, weights))
+                        averaged[name] = start[name] + delta
+                        if flame_sigma > 0:
+                            averaged[name] += torch.randn_like(averaged[name]) * flame_diagnostics['noise_std']
+                    if not torch.isfinite(averaged[name]).all():
+                        raise ValueError(f'Non-finite FedAvg aggregate {name!r}.')
+                model.load_state_dict(averaged, strict=True)
+            if malicious_poisoning:
+                # Evaluate immediately after every global update, before any
+                # forecasting validation or the next round's local training.
+                property_evaluation = evaluate_property(round_number + 1)
+            model.eval()
+            total, elements = 0., 0
+            with torch.no_grad():
+                for batch in model_val_loader:
+                    loss, count_elements = forward_loss(model, batch)
+                    total += loss.item() * count_elements
+                    elements += count_elements
+            metrics = {'round': round_number + 1, 'client_weights': weights, 'assigned_batch_sizes': sizes,
+                       'poisoning_active': poison_active,
+                       'honest_forecasting_loss': float(np.mean(honest_losses)) if honest_losses else None,
+                       'malicious_poisoning_objective': float(np.mean(poison_losses)) if poison_losses else None,
+                       'validation_forecasting_mse': total / elements if elements else None}
+            if aggregation == 'flame':
+                metrics['flame'] = flame_diagnostics
+            if malicious_poisoning:
+                metrics['property_evaluation'] = property_evaluation
+                previous = report['rounds'][-1]['property_evaluation'] if report['rounds'] else report['initial_property_evaluation']
+                metrics['property_mae_improved_over_previous'] = metrics['property_evaluation']['mae'] < previous['mae']
+                print(f'[{aggregation_label} property] round={round_number + 1}/{num_rounds} client={evaluator_client} MAE={metrics["property_evaluation"]["mae"]:.6f}, RMSE={metrics["property_evaluation"]["rmse"]:.6f}, improved={metrics["property_mae_improved_over_previous"]}', flush=True)
+            report['rounds'].append(metrics)
+            if malicious_poisoning:
+                path.write_text(json.dumps(report, indent=2) + '\n')
+            print(f'[{aggregation_label}] round={round_number + 1}/{num_rounds} poisoning_active={poison_active} honest forecasting loss={metrics["honest_forecasting_loss"]}, malicious objective={metrics["malicious_poisoning_objective"]}, validation MSE={metrics["validation_forecasting_mse"]}', flush=True)
+        if num_rounds == 0:
+            print(f'[{aggregation_label}] Zero rounds: no FL training or poisoning updates occurred.', flush=True)
+        elif malicious_poisoning and poison_start_round > num_rounds:
+            print(f'[{aggregation_label}] Poisoning start round was not reached; all rounds used honest training.', flush=True)
+        if malicious_poisoning:
+            final = report['rounds'][-1]['property_evaluation'] if report['rounds'] else report['initial_property_evaluation']
+            # Actual final-global evaluation supplies direct inference metadata, not a fabricated central report.
+            self.poison_feasibility_results = {'design': design, 'constant_property_baseline': baseline,
+                                             'preparation_origin': f'malicious_client_{aggregation}', 'evaluation': final}
+            path.write_text(json.dumps(report, indent=2) + '\n')
+            lines = [f'# Shared-loader malicious-client {aggregation_label}', '',
+                     f'Aggregation: {aggregation}. FedAvg uses assigned batch-size weights; FLAME uses cosine clustering and normalized clipping weights on model deltas, plus noise. Individual benign gradients are observed separately; they are not model submissions.', '',
+                     f'Requested malicious fraction: {fraction}; count: {count}/{clients}; realized: {count / clients}.', '',
+                     f'Evaluator client: {evaluator_client}. Held-out auxiliary gradients are measured after every global update using a fresh global-model copy.', '',
+                     f'Poisoning optimizer: {poison_optimizer}; first poisoning round: {poison_start_round}. Earlier rounds use honest training for every client.', '',
+                     f'Training defense: none. Recorded-gradient defense: {config.get("defense_name", "none")}.', '',
+                     '| Round | Honest forecast loss | Malicious objective | Validation MSE | Property MAE | Property RMSE | Improved over previous |',
+                     '|---:|---:|---:|---:|---:|---:|:---|']
+            for r in report['rounds']:
+                e = r['property_evaluation']
+                lines.append(f'| {r["round"]} | {r["honest_forecasting_loss"]} | {r["malicious_poisoning_objective"]} | {r["validation_forecasting_mse"]} | {e["mae"]} | {e["rmse"]} | {r["property_mae_improved_over_previous"]} |')
+            if num_rounds == 0:
+                lines += ['', 'Zero rounds: no FL poisoning updates occurred.']
+            lines += ['', '| Round | Coordinate / ensemble | Property MAE | Property RMSE | Auxiliary constant MAE |',
+                      '|---:|:---|---:|---:|---:|']
+            for number, evaluation in [(0, report['initial_property_evaluation'])] + [(r['round'], r['property_evaluation']) for r in report['rounds']]:
+                for result in evaluation['coordinate_errors'] + [dict(evaluation, coordinate='ensemble')]:
+                    lines.append(f'| {number} | {result["coordinate"]} | {result["mae"]} | {result["rmse"]} | {evaluation["constant_mae"]} |')
+            lines += ['', 'Round 0 is the initial global model. Low malicious local objective does not establish successful global poisoning.',
+                      '', 'Initial and post-aggregation measurements and settings:', '', '```json', json.dumps(report, indent=2), '```', '']
+            path.with_suffix('.md').write_text('\n'.join(lines))
+            config['fl_poison_report'] = str(path)
+        self.federated_training_results = report
+        return report
+
     def train_model_and_record(self, model, tr_dataloader, config):
+        if config.get("fl_poisoning_enabled", False) and (config.get("poison_feasibility_only", False) or config.get("dataset") not in ETT_DATASETS):
+            raise ValueError("FL poisoning requires ETT and poison_feasibility_only=False.")
         dataset = config["dataset"]
         sampling = config.get("attack_batch_sampling", "random")
         if sampling not in {"random", "property_percentiles"}:
@@ -2741,11 +3244,16 @@ class AttackTSInverseWorker(Worker):
                     f"{len(tr_dataloader)} batches."
                 )
 
-            if config.get("poison_global_model", False):
+            if config.get("fl_poisoning_enabled", False):
+                print("[Preparation] Malicious-client FL selected (takes precedence over centralized poisoning).")
+            elif config.get("poison_global_model", False):
+                print("[Preparation] Centralized poisoning selected.")
                 self.load_or_train_poisoned_global_model(model, config)
                 # Begin benign gradient collection from this poisoned state;
                 # clean FL training here would undo the experimental intervention.
                 model_train_epochs = 0
+            else:
+                print("[Preparation] Clean shared-loader FL selected.")
 
             model_train_loader = DataLoader(
                 tr_dataloader.dataset,
@@ -2757,6 +3265,8 @@ class AttackTSInverseWorker(Worker):
 
             model_val_loader = self.val_dataloader
 
+            # Recording optimizer only (used later if update_model=True).
+            # FedAvg never receives or steps this optimizer.
             optimizer = torch.optim.Adam(
                 model.parameters(),
                 lr=config.get("model_train_learning_rate", 1e-4),
@@ -2764,261 +3274,12 @@ class AttackTSInverseWorker(Worker):
 
             loss_function = nn.MSELoss()
 
-            # TODO: replace the model training loop below with FL simulation code
-            # Step-1: Create a loop spanning the number of epochs for FL. for now model_train_epochs is the number of epochs for FL
-            # Step-2: Create an inner loop spanning the number of clients. Try config.get("num_clients", 10) as the number of clients
-            # Step-3: Create a copy of the model, local_model. 
-            # Step-4: Fetch a batch from the model_train_loader and train the local_model on that batch for a few steps. In the next update, we will have separate train and test dataloaders for each client. For now, use the same model_train_loader for all clients.
-            # Step-5: Compute the gradients for the local_model and store them in a list. You can follow the code after the comment "Bookmark: gradient collection code" to compute the gradients for the local_model. Make sure to store the gradients in a list for each client.
-            # Step-6: The inner loop should end after all clients have been trained for a few steps. After that, outside the inner loop, compute the average of the gradients. 
-            # Step-7: Update the global model with the average gradients. Similar as gradient collection code but instead of storing the gradients, update the global model with the average gradients i.e. param.grad = average_gradients and then optimizer.step() to update the global model.
+            if config.get("fl_poisoning_enabled", False) or not config.get("poison_global_model", False):
+                self.run_federated_training(model, model_train_loader, model_val_loader, config,
+                                            model_train_epochs, malicious_poisoning=config.get("fl_poisoning_enabled", False))
+            if config.get("fl_poisoning_enabled", False):
+                print("[FL] Recording separately observed benign mean-MSE gradients at the final global model.")
 
-
-            # Keep between 10-100
-            num_clients = config.get("num_clients", 10)
-            local_steps = config.get("local_steps", 1)
-            local_lr = config.get("local_lr", 1e-3)
-
-
-            def next_batch(state):
-                # Draw from the shared loader, restarting it when exhausted.
-                try:
-                    return next(state["it"])
-                except StopIteration:
-                    state["it"] = iter(model_train_loader)
-                    return next(state["it"])
-
-
-            def ett_loss(m, batch):
-                batch_x, batch_y, batch_x_mark, batch_y_mark = (
-                    t.float().to(config["device"]) for t in batch
-                )
-                dec_inp = torch.cat(
-                    [batch_y[:, :label_len, :], torch.zeros_like(batch_y[:, -pred_len:, :])],
-                    dim=1,
-                )
-                outputs = m(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                if isinstance(outputs, tuple):
-                    outputs = outputs[0]
-                outputs = outputs[:, -pred_len:, f_dim:]
-                targets = batch_y[:, -pred_len:, f_dim:]
-
-                if outputs.shape != targets.shape:
-                    raise ValueError(
-                        f"ETT output shape {tuple(outputs.shape)} "
-                        f"does not match target shape {tuple(targets.shape)}."
-                    )
-                return loss_function(outputs, targets)
-
-            loader_state = {"it": iter(model_train_loader)}
-            debug_fl = config.get("debug_fl", False)
-
-            # Debug printouts are limit
-            debug_rounds = 100 
-
-
-            # Step 1
-            for epoch in range(model_train_epochs):
-                model.train()
-                client_gradients = []   # Step 5: one gradient list per client
-                round_loss = []
-
-                # Step 2
-                for client in range(num_clients):
-
-                    # Step 3
-                    local_model = deepcopy(model)
-                    local_model.train()
-                    local_optimizer = torch.optim.SGD(local_model.parameters(), lr=local_lr)
-
-                    # Step 4
-                    batch = next_batch(loader_state)
-                    for _ in range(local_steps):
-                        local_optimizer.zero_grad(set_to_none=True)
-                        loss = ett_loss(local_model, batch)
-                        loss.backward()
-                        local_optimizer.step()
-
-                    # Step 5
-                    local_model.zero_grad(set_to_none=True)
-                    loss = ett_loss(local_model, batch)
-                    loss.backward()
-                    round_loss.append(loss.item())
-
-                    # Bookmark: gradient collection code
-                    gradients = []
-                    for name, parameter in local_model.named_parameters():
-                        if not parameter.requires_grad:
-                            continue
-                        if parameter.grad is None:
-                            raise RuntimeError(f"No gradient for parameter {name!r}.")
-                        if not torch.isfinite(parameter.grad).all():
-                            raise RuntimeError(f"Non-finite gradient for {name!r}.")
-                        gradients.append(parameter.grad.detach().clone())
-
-
-                    # Optional: client-side defenses (the server only sees these)
-                    
-                    if config.get("defense_name", "none") not in {None, "none"}:
-                        if config.get("sign", False):
-                            gradients = apply_sign_transformation(gradients)
-                        if config.get("prune_rate") is not None:
-                            gradients = apply_pruning(gradients, config["prune_rate"])
-                        if config.get("dp_epsilon", 0) > 0:
-                            gradients = add_gaussian_noise(gradients, config["dp_epsilon"])
-                    
-
-                    client_gradients.append(gradients)
-
-
-                    # Debug printouts
-                    if debug_fl and epoch < debug_rounds:
-                        g0 = gradients[0]
-                        print(
-                            f"[FL debug] round {epoch + 1} client {client:02d} | "
-                            f"grad[0] shape={tuple(g0.shape)} "
-                            f"norm={g0.norm().item():.6f} "
-                            f"first5={g0.flatten()[:5].tolist()}"
-                        )
-
-                # Step 6
-                average_gradients = [
-                    torch.stack(per_param).mean(dim=0)
-                    for per_param in zip(*client_gradients)
-                ]
-
-                # Debug printouts
-                if debug_fl and epoch < debug_rounds:
-                    avg0 = average_gradients[0]
-                    print(
-                        f"[FL debug] round {epoch + 1} AVERAGE | "
-                        f"grad[0] shape={tuple(avg0.shape)} "
-                        f"norm={avg0.norm().item():.6f} "
-                        f"first5={avg0.flatten()[:5].tolist()}"
-                    )
-
-                    # Independent check: recompute the mean by hand.
-                    manual_avg0 = sum(cg[0] for cg in client_gradients) / len(client_gradients)
-                    print(
-                        "[FL debug] max |avg - manual avg| ="
-                        f" {(avg0 - manual_avg0).abs().max().item():.3e}"
-                    )
-
-                    # Are clients actually different from each other?
-                    stacked0 = torch.stack([cg[0] for cg in client_gradients])
-                    print(
-                        "[FL debug] mean per-element std across clients ="
-                        f" {stacked0.std(dim=0).mean().item():.3e}"
-                    )
-
-                # Step 7
-                optimizer.zero_grad(set_to_none=True)
-                for parameter, gradient in zip(
-                    (p for p in model.parameters() if p.requires_grad), average_gradients
-                ):
-                    parameter.grad = gradient
-                optimizer.step()
-
-                # Validate the model after each round.
-                model.eval()
-                val_loss = 0.0
-                val_target_elements = 0
-                with torch.no_grad():
-                    for batch_x, batch_y, batch_x_mark, batch_y_mark in tqdm(model_val_loader, desc=f"Validating after round {epoch + 1}"):
-                        batch_x = batch_x.float().to(config["device"])
-                        batch_y = batch_y.float().to(config["device"])
-                        batch_x_mark = batch_x_mark.float().to(config["device"])
-                        batch_y_mark = batch_y_mark.float().to(config["device"])
-
-                        dec_inp = torch.cat(
-                            [
-                                batch_y[:, :label_len, :],
-                                torch.zeros_like(batch_y[:, -pred_len:, :]),
-                            ],
-                            dim=1,
-                        )
-
-                        outputs = model(
-                            batch_x,
-                            batch_x_mark,
-                            dec_inp,
-                            batch_y_mark,
-                        )
-                        if isinstance(outputs, tuple):
-                            outputs = outputs[0]
-
-                        outputs = outputs[:, -pred_len:, f_dim:]
-                        targets = batch_y[:, -pred_len:, f_dim:]
-
-                        loss = loss_function(outputs, targets)
-                        val_loss += loss.item() * targets.numel()
-                        val_target_elements += targets.numel()
-
-                print(
-                    f"FL round {epoch + 1:02d}/{model_train_epochs} | "
-                    f"validation MSE {val_loss / val_target_elements:.6f}"
-                )
-
-                # print(
-                #     f"FL round {epoch + 1:02d}/{model_train_epochs} | "
-                #     f"mean client MSE {np.mean(round_loss):.6f}"
-                # )
-
-
-            '''
-            # Train the forecasting model.
-            for epoch in range(model_train_epochs):
-                model.train()
-
-                epoch_squared_error = 0.0
-                epoch_target_elements = 0
-
-                for batch_x, batch_y, batch_x_mark, batch_y_mark in model_train_loader:
-                    batch_x = batch_x.float().to(config["device"])
-                    batch_y = batch_y.float().to(config["device"])
-                    batch_x_mark = batch_x_mark.float().to(config["device"])
-                    batch_y_mark = batch_y_mark.float().to(config["device"])
-
-                    dec_inp = torch.cat(
-                        [
-                            batch_y[:, :label_len, :],
-                            torch.zeros_like(batch_y[:, -pred_len:, :]),
-                        ],
-                        dim=1,
-                    )
-
-                    optimizer.zero_grad(set_to_none=True)
-
-                    outputs = model(
-                        batch_x,
-                        batch_x_mark,
-                        dec_inp,
-                        batch_y_mark,
-                    )
-                    if isinstance(outputs, tuple):
-                        outputs = outputs[0]
-
-                    outputs = outputs[:, -pred_len:, f_dim:]
-                    targets = batch_y[:, -pred_len:, f_dim:]
-
-                    if outputs.shape != targets.shape:
-                        raise ValueError(
-                            f"ETT output shape {tuple(outputs.shape)} "
-                            f"does not match target shape {tuple(targets.shape)}."
-                        )
-
-                    loss = loss_function(outputs, targets)
-                    loss.backward()
-                    optimizer.step()
-
-                    epoch_squared_error += loss.item() * targets.numel()
-                    epoch_target_elements += targets.numel()
-
-                print(
-                    f"ETT epoch {epoch + 1:02d}/{model_train_epochs} | "
-                    f"MSE {epoch_squared_error / epoch_target_elements:.6f}"
-                )
-            '''
             # Record deterministic gradients, with dropout disabled.
             # Reconstruction must also use model.eval().
             model.eval()

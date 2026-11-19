@@ -76,8 +76,8 @@ def start_multi_process(g_config, a_config, d_config, m_config, pool_size):
 
 
 global_config = {
-    'logger_service': 'wandb',
-    # 'logger_service': 'none',
+    # 'logger_service': 'wandb',
+    'logger_service': 'none',
     'experiment_name': 'ts-inverse_batch1_without_target_reconst_12-6-2024',
     # 'seed': [10, 43, 28, 80, 71], # 28, 80, 71],
     'seed': [43], # 28, 80, 71],
@@ -106,7 +106,7 @@ global_config = {
     'dropout_probability_regularizer': 0,
     'dummy_init_method': 'rand',
 
-    "model_train_epochs": 0,
+    "model_train_epochs": 200,
     "model_train_batch_size": 64,
     "model_train_learning_rate": 1e-3,
 
@@ -138,12 +138,23 @@ global_config = {
     "reconstruction_output_dir": (
         "/scratch/ejk5818/ts-inverse/reconstructions/"
     ),
+
+    "fl_aggregation": "fedavg",  # default: "fedavg"
+    "flame_sigma": 0.0001,
+
+    "fl_poisoning_enabled": True,
+    "fl_poison_optimizer": "adam",
+    # Optional; default is 0.1:
+    "fl_malicious_fraction": 0.1,
+    "fl_poison_local_steps": 10,
+    "fl_poison_start_round": 51,
+    "fl_poison_learning_rate": 1e-2,
 }
 
 attack_config = [
     {
         'attack_method': 'TS-Inverse',
-        "attack_mode": "both",
+        "attack_mode": "poisoning_assisted_property_inference",
         # Opt-in, two-stage generative attack. The original direct-input
         # optimization remains unchanged when this flag is False.
         'timegan_gifd_enabled': True,
