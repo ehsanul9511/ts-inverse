@@ -44,16 +44,28 @@ from ts_inverse.datahandler import (
     get_mean_std_dataloader,
     get_ett_dataset,
     get_ett_client_datasets,
+    get_custom_dataset,
+    get_custom_client_datasets,
 )
 from .forecasting_worker import evaluate_model
 
 ETT_DATASETS = ["ETTh1", "ETTh2", "ETTm1", "ETTm2"]
+
+CUSTOM_DATASETS = ["weather"]
+
 
 FEATURE_NAMES = [
     "acc_x", "acc_y", "acc_z",
     "gyro_x", "gyro_y", "gyro_z",
     "gravity_x", "gravity_y", "gravity_z",
     "rot_rate_x", "rot_rate_y", "rot_rate_z",
+]
+
+WEATHER_FEATURE_NAMES = [
+    "H2OC", "PAR", "SWDR", "T", "Tdew", "Tlog", "Tpot",
+    "VPact", "VPdef", "VPmax", "max_PAR", "max_wv",
+    "p", "rain", "raining", "rh", "rho", "sh", "wd", "wv",
+    "OT",
 ]
 
 FEATURE_GROUPS = {
@@ -91,6 +103,24 @@ class AttackTSInverseWorker(Worker):
                 )
             )
             print(f"Loaded ETT dataset")
+        
+        elif dataset_name in CUSTOM_DATASETS:
+            self.train_datasets, self.val_datasets, self.test_datasets = (
+                get_custom_dataset(
+                    dataset=dataset_name,
+                    root_path=d_c["root_path"],
+                    data_path=d_c.get("data_path"),
+                    seq_len=d_c.get("seq_len", 96),
+                    label_len=d_c.get("label_len", 48),
+                    pred_len=d_c.get("pred_len", 96),
+                    features=d_c.get("features", "M"),
+                    target=d_c.get("target", "OT"),
+                    scale=d_c.get("scale", True),
+                    timeenc=d_c.get("timeenc", 0),
+                    freq=d_c.get("freq", "h"),
+                )
+            )
+            print(f"Loaded custom dataset {dataset_name}")
 
 
         else:
@@ -130,9 +160,14 @@ class AttackTSInverseWorker(Worker):
         # train_dataloader above is kept untouched: it is still used for mean/std.
         self.client_datasets = None
         self.client_dataloaders = None
-        if dataset_name in ETT_DATASETS:
+        if dataset_name in ETT_DATASETS + CUSTOM_DATASETS:
             num_clients = d_c.get("num_clients", c.get("num_clients", 10))
-            self.client_datasets = get_ett_client_datasets(
+            client_getter = (
+                get_custom_client_datasets
+                if dataset_name in CUSTOM_DATASETS
+                else get_ett_client_datasets
+            )
+            self.client_datasets = client_getter(
                 dataset=dataset_name,
                 root_path=d_c["root_path"],
                 data_path=d_c.get("data_path"),
@@ -165,10 +200,10 @@ class AttackTSInverseWorker(Worker):
         ) = get_mean_std_dataloader(
             mean_std_dataloader,
             c["device"],
-            target_length=self.train_datasets[0].pred_len if dataset_name in ETT_DATASETS else None
+            target_length=self.train_datasets[0].pred_len if dataset_name in ETT_DATASETS + CUSTOM_DATASETS else None
         )
 
-        if dataset_name in ETT_DATASETS:
+        if dataset_name in ETT_DATASETS + CUSTOM_DATASETS:
             model = final_model_settings["_model"]()
 
         else:
@@ -282,7 +317,7 @@ class AttackTSInverseWorker(Worker):
 
         dataset_name = config["dataset"]
 
-        if dataset_name in ETT_DATASETS:
+        if dataset_name in ETT_DATASETS + CUSTOM_DATASETS:
             # ETT uses all input channels.
             # For M/S, retain all target statistics already calculated.
             if config.get("features", "M") == "MS":
@@ -300,7 +335,7 @@ class AttackTSInverseWorker(Worker):
             )
         config["model_size"] = sum(
             p.numel() for p in model.parameters()
-            if config["dataset"] not in ETT_DATASETS or p.requires_grad
+            if config["dataset"] not in ETT_DATASETS + CUSTOM_DATASETS or p.requires_grad
         )
 
         if "aux_dataset" in config and config["aux_dataset"] is not None:
@@ -370,7 +405,7 @@ class AttackTSInverseWorker(Worker):
         }
         self._parallel_attacks = parallel
         self._attack_started_at = time.monotonic()
-        if config.get("dataset") in ETT_DATASETS and (not direct or config.get("attack_mode") == "both"):
+        if config.get("dataset") in ETT_DATASETS + CUSTOM_DATASETS and (not direct or config.get("attack_mode") == "both"):
             self._reconstruction_run_dir = self._create_reconstruction_run(config)
 
         def run_batch(batch_number):
@@ -455,7 +490,7 @@ class AttackTSInverseWorker(Worker):
         model.eval()
 
         # All batch workers have finished saving; evaluate this run explicitly.
-        if config.get("dataset") in ETT_DATASETS and any(self._reconstruction_run_dir.glob("batch_*.pt")):
+        if config.get("dataset") in ETT_DATASETS + CUSTOM_DATASETS and any(self._reconstruction_run_dir.glob("batch_*.pt")):
             from pi_eval.evaluate_reconstruction_run import main as evaluate_reconstruction_run
 
             wandb_run = None
@@ -681,7 +716,7 @@ class AttackTSInverseWorker(Worker):
         if mode == "both" and config.get("num_attack_steps", 0) <= 0:
             raise ValueError("attack_mode=both requires num_attack_steps > 0 to generate a reconstruction.")
         if direct:
-            if not (config.get("poison_global_model", False) or config.get("fl_poisoning_enabled", False)) or config.get("dataset") not in ETT_DATASETS:
+            if not (config.get("poison_global_model", False) or config.get("fl_poisoning_enabled", False)) or config.get("dataset") not in ETT_DATASETS + CUSTOM_DATASETS:
                 raise ValueError("Direct property inference requires centralized or FL poisoning and an ETT dataset.")
             if config.get("poison_feasibility_only", False):
                 raise ValueError("Set poison_feasibility_only=False to evaluate recorded client gradients.")
@@ -950,7 +985,7 @@ class AttackTSInverseWorker(Worker):
                     batch_inputs.shape[0] // config["inversion_batch_size"], 1, 1, 1
                 )
                 if predicted_dummy_quantile_targets is not None:
-                    if config["dataset"] in ETT_DATASETS:
+                    if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
                         regularization_targets = (
                             predicted_dummy_quantile_targets.squeeze(0).repeat(
                                 batch_targets.shape[0]
@@ -1002,7 +1037,7 @@ class AttackTSInverseWorker(Worker):
             )
 
         optimize_targets = config["attack_targets"] and (
-            config["dataset"] in ETT_DATASETS
+            config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS
             or config["batch_size"] > 1
             or not config["one_shot_targets"]
         )
@@ -1028,7 +1063,7 @@ class AttackTSInverseWorker(Worker):
         )
 
         sample_mapping = np.arange(0, batch_inputs.shape[0])
-        if config['dataset'] not in ETT_DATASETS:
+        if config['dataset'] not in ETT_DATASETS + CUSTOM_DATASETS:
             with getattr(self, "_attack_logging_lock", nullcontext()):
                 plot_original_and_dummy_data(config, sample_mapping, dummy_inputs, dummy_targets, batch_inputs, batch_targets)
 
@@ -1068,7 +1103,7 @@ class AttackTSInverseWorker(Worker):
                     "periodicity_regularization": zero_loss,
                 }
 
-                if config["dataset"] in ETT_DATASETS:
+                if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
                     pred_len = self.train_datasets[0].pred_len
                     label_len = self.train_datasets[0].label_len
                     feature_mode = self.train_datasets[0].features
@@ -1125,7 +1160,7 @@ class AttackTSInverseWorker(Worker):
                 dummy_dy_dx = torch.autograd.grad(
                     dummy_y,
                     [p for p in model.parameters()
-                     if config["dataset"] not in ETT_DATASETS or p.requires_grad],
+                     if config["dataset"] not in ETT_DATASETS + CUSTOM_DATASETS or p.requires_grad],
                     create_graph=True,
                 )
 
@@ -1173,7 +1208,7 @@ class AttackTSInverseWorker(Worker):
                 if (
                     config.get('total_variation_beta_targets', 0) > 0
                 ):
-                    if config["dataset"] in ETT_DATASETS:
+                    if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
                         tv_targets = dummy_targets
                     else:
                         tv_targets = dummy_targets.unsqueeze(-1)
@@ -1183,7 +1218,7 @@ class AttackTSInverseWorker(Worker):
                         * total_variation_time_series(tv_targets)
                     )
 
-                if config["dataset"] in ETT_DATASETS:
+                if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
                     if self.train_datasets[0].features == "MS":
                         history = dummy_inputs[..., -1:]
                     else:
@@ -1212,7 +1247,7 @@ class AttackTSInverseWorker(Worker):
 
                 if config.get("lower_res_term_targets", 0) > 0:
                     with torch.no_grad():
-                        if config["dataset"] in ETT_DATASETS:
+                        if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
                             targets_for_filtering = dummy_targets
                         else:
                             targets_for_filtering = dummy_targets.unsqueeze(-1)
@@ -1224,7 +1259,7 @@ class AttackTSInverseWorker(Worker):
                             warped_targets, dummy_targets.shape[1]
                         )
 
-                        if config["dataset"] not in ETT_DATASETS:
+                        if config["dataset"] not in ETT_DATASETS + CUSTOM_DATASETS:
                             filtered_targets = filtered_targets.squeeze(-1)
 
                     loss_components["lower_resolution_targets"] = (
@@ -1253,7 +1288,7 @@ class AttackTSInverseWorker(Worker):
                         else 1
                     )
 
-                    if config['dataset'] in ETT_DATASETS:
+                    if config['dataset'] in ETT_DATASETS + CUSTOM_DATASETS:
                         trend_loss = featurewise_trend_regularization(
                             combined_dummy_data,
                             config["trend_loss"],
@@ -1290,7 +1325,7 @@ class AttackTSInverseWorker(Worker):
                         else 1
                     )
 
-                    if config["dataset"] in ETT_DATASETS:
+                    if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
                         periodicity_loss = featurewise_periodicity_regularization(
                             combined_dummy_data,
                             period=int(config["periodicity_period"]),
@@ -1315,7 +1350,7 @@ class AttackTSInverseWorker(Worker):
 
                 if config["grad_signs_for_inputs"]:
                     input_variable.grad.sign_()
-                if config["dataset"] in ETT_DATASETS:
+                if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
                     if (
                         config["attack_targets"]
                         and config["grad_signs_for_targets"]
@@ -1412,7 +1447,7 @@ class AttackTSInverseWorker(Worker):
         )
 
 
-        if config["dataset"] in ETT_DATASETS:
+        if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
             self._save_batch_reconstruction(config, batch_number, batch_inputs, dummy_inputs)
         return dummy_inputs.detach()
 
@@ -1573,7 +1608,7 @@ class AttackTSInverseWorker(Worker):
                     config["quantiles"],
                 )
 
-            if config["dataset"] in ETT_DATASETS:
+            if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
                 # ETT targets already have a feature dimension.
                 predicted_targets = predicted_targets.repeat(
                     1,
@@ -1665,7 +1700,7 @@ class AttackTSInverseWorker(Worker):
                 def pinball_loss_simple(batch_inputs, dummy_inputs):
                     return pinball_loss(dummy_inputs, batch_inputs, config["quantiles"])
 
-                if config['dataset'] in {'mobifall'} or (config['dataset'] in ETT_DATASETS and predicted_dummy_quantile_targets is None):
+                if config['dataset'] in {'mobifall'} or (config['dataset'] in ETT_DATASETS + CUSTOM_DATASETS and predicted_dummy_quantile_targets is None):
                     input_sample_mapping = get_batch_sample_mapping(
                         batch_inputs,
                         dummy_inputs,
@@ -1688,7 +1723,7 @@ class AttackTSInverseWorker(Worker):
                     return
 
                 if predicted_dummy_quantile_targets is not None:
-                    if config["dataset"] in ETT_DATASETS:
+                    if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
                         dummy_quantile_targets = (
                             predicted_dummy_quantile_targets.squeeze(0).repeat(
                                 batch_targets.shape[0] // config["inversion_batch_size"],
@@ -1732,7 +1767,7 @@ class AttackTSInverseWorker(Worker):
                     }
                     attack_metrics.update(individual_evaluation)
 
-                if config["dataset"] in ETT_DATASETS:
+                if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
                     plot_interval = max(1, config["num_learn_epochs"] // 10)
                 else:
                     plot_interval = config["num_learn_epochs"] // 10
@@ -1753,7 +1788,7 @@ class AttackTSInverseWorker(Worker):
                 dummy_inputs = dummy_inputs.repeat(batch_inputs.size(0) // dummy_inputs.size(1), 1, 1, 1)
                 dummy_inputs = dummy_inputs.view(batch_inputs.size())
                 if predicted_dummy_targets is not None:
-                    if config["dataset"] in ETT_DATASETS:
+                    if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
                         predicted_dummy_targets = predicted_dummy_targets.repeat(
                             batch_targets.size(0) // predicted_dummy_targets.size(1),
                             1,
@@ -1809,7 +1844,7 @@ class AttackTSInverseWorker(Worker):
             )  # gradients are always averaged over batch size
             aux_inputs = aux_inputs.view(batch_size, config["batch_size"], *aux_inputs.shape[-2:])
 
-            if config["dataset"] in ETT_DATASETS:
+            if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
                 aux_targets = aux_targets.reshape(
                     batch_size,
                     config["batch_size"],
@@ -1823,12 +1858,12 @@ class AttackTSInverseWorker(Worker):
                 )
 
             if (
-                config['dataset'] not in ETT_DATASETS and (aux_inputs.min() < 0 or aux_inputs.max() > 1)
+                config['dataset'] not in ETT_DATASETS + CUSTOM_DATASETS and (aux_inputs.min() < 0 or aux_inputs.max() > 1)
             ):
                 self._print_batch("Aux inputs out of range:", aux_inputs.min(), aux_inputs.max())
 
             if (
-                config['dataset'] not in ETT_DATASETS and (aux_targets.min() < 0 or aux_targets.max() > 1)
+                config['dataset'] not in ETT_DATASETS + CUSTOM_DATASETS and (aux_targets.min() < 0 or aux_targets.max() > 1)
             ):
                 self._print_batch("Aux targets out of range:", aux_targets.min(), aux_targets.max())
 
@@ -2038,7 +2073,7 @@ class AttackTSInverseWorker(Worker):
         poison_strategy = config.get("poison_strategy", "fixed_projection")
         if poison_strategy not in {"constant_bias", "fixed_projection"}:
             raise ValueError("poison_strategy must be 'constant_bias' or 'fixed_projection'.")
-        if config["dataset"] not in ETT_DATASETS or config.get("aux_dataset") is not None:
+        if config["dataset"] not in ETT_DATASETS + CUSTOM_DATASETS or config.get("aux_dataset") is not None:
             raise ValueError("Weights-only measurement preparation requires the existing ETT auxiliary splits.")
         feasibility_only = config.get("poison_feasibility_only", False)
         if not feasibility_only and (config.get("update_model", False)
@@ -3213,19 +3248,19 @@ class AttackTSInverseWorker(Worker):
         return report
 
     def train_model_and_record(self, model, tr_dataloader, config):
-        if config.get("fl_poisoning_enabled", False) and (config.get("poison_feasibility_only", False) or config.get("dataset") not in ETT_DATASETS):
+        if config.get("fl_poisoning_enabled", False) and (config.get("poison_feasibility_only", False) or config.get("dataset") not in ETT_DATASETS + CUSTOM_DATASETS):
             raise ValueError("FL poisoning requires ETT and poison_feasibility_only=False.")
         dataset = config["dataset"]
         sampling = config.get("attack_batch_sampling", "random")
         if sampling not in {"random", "property_percentiles"}:
             raise ValueError("attack_batch_sampling must be 'random' or 'property_percentiles'.")
-        if sampling == "property_percentiles" and dataset not in ETT_DATASETS:
+        if sampling == "property_percentiles" and dataset not in ETT_DATASETS + CUSTOM_DATASETS:
             raise ValueError("Property-percentile attack sampling currently supports ETT datasets only.")
-        if config.get("poison_global_model", False) and dataset not in ETT_DATASETS:
+        if config.get("poison_global_model", False) and dataset not in ETT_DATASETS + CUSTOM_DATASETS:
             raise ValueError("Poisoned global-model training currently supports ETT datasets only.")
         model.to(config["device"])
         all_batch_inputs, all_batch_targets, all_model_state_dicts, all_model_gradients, all_model_updates = [], [], [], [], []
-        if dataset in ETT_DATASETS:
+        if dataset in ETT_DATASETS + CUSTOM_DATASETS:
             pred_len = self.train_datasets[0].pred_len
             label_len = self.train_datasets[0].label_len
             feature_mode = self.train_datasets[0].features
@@ -3831,7 +3866,7 @@ class AttackTSInverseWorker(Worker):
             attack_metrics.update(mean_evaluation)
 
             # Optional evaluation only; existing datasets/configs remain unchanged.
-            if dataset_name in ETT_DATASETS and (
+            if dataset_name in ETT_DATASETS + CUSTOM_DATASETS and (
                 config.get("eval_ts2vec", False) or config.get("eval_catch22", False)
             ):
                 interval = int(config.get("extra_eval_interval", 0))
@@ -3862,7 +3897,7 @@ class AttackTSInverseWorker(Worker):
                 }
                 attack_metrics.update(individual_evaluation)
 
-            if dataset_name not in ETT_DATASETS and attack_step % (num_attack_steps // log_plots_n_times) == 0:
+            if dataset_name not in ETT_DATASETS + CUSTOM_DATASETS and attack_step % (num_attack_steps // log_plots_n_times) == 0:
                 df, fig = plot_original_and_dummy_data(
                     config, sample_mapping, dummy_inputs, dummy_targets, batch_inputs, batch_targets
                 )
@@ -3870,7 +3905,7 @@ class AttackTSInverseWorker(Worker):
                 self._log_matplotlib_figure(fig, step=attack_step + attack_step_offset, log_name=f"_batch_{batch_number}")
 
             elif attack_step % (num_attack_steps // log_plots_n_times) == 0 or attack_step == num_attack_steps - 1:
-                plot_targets_separate = config.get("plot_targets_separate", dataset_name in ETT_DATASETS)
+                plot_targets_separate = config.get("plot_targets_separate", dataset_name in ETT_DATASETS + CUSTOM_DATASETS)
                 reconstruction_plot_styles = config.get("reconstruction_plot_styles", ["overlay", "channel_grid"])
                 for style in reconstruction_plot_styles:
                     for sample_idx in range(batch_inputs.shape[0]):
@@ -4165,9 +4200,11 @@ def plot_channel_grid_original_vs_reconstructed(config, sample_mapping, dummy_in
     return df, fig
 
 def get_feature_names(config, num_features):
-    if config["dataset"] in ETT_DATASETS:
+    if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
         if config.get("features", "M") == "S":
             names = [config.get("target", "OT")]
+        elif config["dataset"] in CUSTOM_DATASETS:
+            names = WEATHER_FEATURE_NAMES
         else:
             names = ETT_FEATURE_NAMES
     else:
@@ -4333,13 +4370,13 @@ def create_gradient_inversion_dataloader(
     model.eval()
     gradient_parameters = [
         p for p in model.parameters()
-        if config["dataset"] not in ETT_DATASETS or p.requires_grad
+        if config["dataset"] not in ETT_DATASETS + CUSTOM_DATASETS or p.requires_grad
     ]
 
     folder_path = "../data/_model_dataset_gradients/"
     task_kind = "forecasting_mse_v1"
     # Path where the dataset will be saved or loaded from
-    if config["dataset"] in ETT_DATASETS:
+    if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
         # TODO: Include the complete configuration, victim weights, and
         # auxiliary-data identity. Currently assumes one fixed setup per dataset.
         dataset_path = (
@@ -4367,7 +4404,7 @@ def create_gradient_inversion_dataloader(
         for i, batch in enumerate(aux_dataloader):
             model.zero_grad(set_to_none=True)
 
-            if config["dataset"] in ETT_DATASETS:
+            if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
                 (
                     aux_batch_inputs,
                     aux_batch_targets,
@@ -4476,7 +4513,7 @@ def create_gradient_inversion_dataloader(
             aux_y.backward()
 
             if config["verbose"]:
-                if config["dataset"] in ETT_DATASETS:
+                if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
                     for name, parameter in model.named_parameters():
                         if not parameter.requires_grad:
                             continue
@@ -4592,7 +4629,7 @@ def plot_quantile_dummy_data(config, sample_mapping, dummy_quantile_inputs, dumm
 
         # Plotting quantiles for dummy targets
         for q in range(num_quantiles):
-            if config["dataset"] in ETT_DATASETS:
+            if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
                 for feature in range(dummy_quantile_targets.shape[2]):
                     dummy_target_quantiles = (
                         dummy_quantile_targets[j, :, feature, q]
@@ -4631,7 +4668,7 @@ def plot_quantile_dummy_data(config, sample_mapping, dummy_quantile_inputs, dumm
     # Create weights and biases plot & dataframe
     fill_nan = np.empty(batch_targets.shape[1])
     fill_nan.fill(np.nan)
-    if config["dataset"] in ETT_DATASETS:
+    if config["dataset"] in ETT_DATASETS + CUSTOM_DATASETS:
         batch_targets_dict = {
             f"batch_targets_{i}_{feature}": np.concatenate(
                 (

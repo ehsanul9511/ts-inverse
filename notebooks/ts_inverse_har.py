@@ -13,7 +13,7 @@ username = os.getenv("USER")
 
 data_path_dict = {
     "ejk5818": "/scratch/ejk5818/ts-inverse/data/ETT-small/",
-    "ddl5280": "/scratch/ddl5280/research/ts-inverse/data/ETT/",
+    "ddl5280": "/scratch/ddl5280/research/weather/ts-inverse/data/",
 }
 
 # Check if CUDA is available
@@ -136,7 +136,8 @@ global_config = {
     "poison_ensemble_loss_weight": 0.5,
 
     "reconstruction_output_dir": (
-        "/scratch/ejk5818/ts-inverse/reconstructions/"
+        #"/scratch/ejk5818/ts-inverse/reconstructions/"
+        "/scratch/ddl5280/research/weather/ts-inverse/reconstructions/"
     ),
 
     "fl_aggregation": "fedavg",  # default: "fedavg"
@@ -159,7 +160,7 @@ attack_config = [
         # optimization remains unchanged when this flag is False.
         'timegan_gifd_enabled': True,
         'timegan_checkpoint_root': (
-            '/scratch/ddl5280/research/ts-inverse/models/'
+            '/scratch/ddl5280/research/weather/ts-inverse/models/'
             'mobifall_timegan'
         ),
         'timegan_gifd_latent_steps': 2000,
@@ -234,10 +235,10 @@ attack_config = [
 
     },
 ]
-
+'''
 dataset_config = [
     {
-        "dataset": "ETTh1",
+        "dataset": "Weather",
         "root_path": data_path_dict[username] if username in data_path_dict else None,
         "seq_len": 96,
         "label_len": 48,
@@ -248,6 +249,24 @@ dataset_config = [
         "timeenc": 0,
         "freq": "h",
         "normalize": "standard",
+        "observation_days": 96,
+        "future_days": 96,
+    },
+]
+'''
+dataset_config = [
+    {
+        "dataset": "weather",
+        "root_path": data_path_dict[username],
+        "data_path": "Weather_wide.csv",
+        "seq_len": 96,
+        "label_len": 48,
+        "pred_len": 96,
+        "features": "M",
+        "target": "OT",
+        "scale": True,
+        "timeenc": 0,
+        "freq": "h",
         "observation_days": 96,
         "future_days": 96,
     },

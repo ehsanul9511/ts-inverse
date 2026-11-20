@@ -118,6 +118,94 @@ def split_dataframe_equally(frame, num_clients):
         for i in range(num_clients)
     ]
 
+def load_custom_dataframe(
+    root_path,
+    data_path,
+    flag="train",
+    seq_len=96,
+    features="M",
+    target="OT",
+    scale=True,
+    timeenc=0,
+    freq="h",
+):
+    """
+    Dataframe version of Dataset_Custom.__read_data__ (iTransformer), used for
+    e.g. the weather dataset.
+
+    Returns (frame, scaler). `frame` holds the scaled feature columns followed
+    by the time-stamp columns (prefixed with ETT_STAMP_PREFIX), for the
+    requested split only.
+
+    Borders follow Dataset_Custom: 70% train / 10% val / 20% test, where the
+    val and test splits start seq_len rows early so the first window has a
+    full look-back.
+    """
+    assert flag in ["train", "test", "val"]
+    set_type = {"train": 0, "val": 1, "test": 2}[flag]
+
+    df_raw = pd.read_csv(os.path.join(root_path, data_path))
+
+    # Reorder to ['date', ...other features, target]
+    cols = list(df_raw.columns)
+    cols.remove(target)
+    cols.remove("date")
+    df_raw = df_raw[["date"] + cols + [target]]
+
+    num_train = int(len(df_raw) * 0.7)
+    num_test = int(len(df_raw) * 0.2)
+    num_vali = len(df_raw) - num_train - num_test
+    border1s = [0, num_train - seq_len, len(df_raw) - num_test - seq_len]
+    border2s = [num_train, num_train + num_vali, len(df_raw)]
+    border1, border2 = border1s[set_type], border2s[set_type]
+
+    if features in ("M", "MS"):
+        df_data = df_raw[df_raw.columns[1:]]
+    elif features == "S":
+        df_data = df_raw[[target]]
+    else:
+        raise ValueError(f"Unknown features mode {features!r}")
+
+    # Scaler is always fit on the train split only.
+    scaler = StandardScaler()
+    if scale:
+        scaler.fit(df_data[border1s[0]:border2s[0]].values)
+        values = scaler.transform(df_data.values)
+    else:
+        values = df_data.values
+
+    frame = pd.DataFrame(values, columns=df_data.columns)
+    frame["date"] = pd.to_datetime(df_raw["date"])
+
+    frame = (
+        frame.iloc[border1:border2]
+        .sort_values("date", kind="stable")
+        .reset_index(drop=True)
+    )
+
+    date = frame["date"]
+    if timeenc == 0:
+        stamp = pd.DataFrame(
+            {
+                "month": date.dt.month,
+                "day": date.dt.day,
+                "weekday": date.dt.weekday,
+                "hour": date.dt.hour,
+            }
+        )
+    elif timeenc == 1:
+        if time_features is None:
+            raise ImportError("timeenc=1 needs `time_features` (utils.timefeatures).")
+        arr = time_features(pd.to_datetime(date.values), freq=freq).transpose(1, 0)
+        stamp = pd.DataFrame(arr)
+    else:
+        raise ValueError(f"Unknown timeenc {timeenc!r}")
+
+    stamp.columns = [f"{ETT_STAMP_PREFIX}{c}" for c in stamp.columns]
+    frame = pd.concat([frame.drop(columns=["date"]), stamp], axis=1)
+    return frame, scaler
+
+
 class _ETTFromDataFrameMixin:
     """Dataframe -> Dataset constructor (the final block of __read_data__)."""
 
@@ -313,6 +401,103 @@ class Dataset_ETT_minute(_ETTFromDataFrameMixin, Dataset):
  
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)
+
+class Dataset_Custom(_ETTFromDataFrameMixin, Dataset):
+    def __init__(self, root_path, flag='train', size=None,
+                 features='S', data_path='ETTh1.csv',
+                 target='OT', scale=True, timeenc=0, freq='h', dataframe=None, scaler=None):
+        # size [seq_len, label_len, pred_len]
+        if size == None:
+            self.seq_len = 24 * 4 * 4
+            self.label_len = 24 * 4
+            self.pred_len = 24 * 4
+        else:
+            self.seq_len = size[0]
+            self.label_len = size[1]
+            self.pred_len = size[2]
+        assert flag in ['train', 'test', 'val']
+        type_map = {'train': 0, 'val': 1, 'test': 2}
+        self.set_type = type_map[flag]
+
+        self.features = features
+        self.target = target
+        self.scale = scale
+        self.timeenc = timeenc
+        self.freq = freq
+
+        self.root_path = root_path
+        self.data_path = data_path
+        if dataframe is not None:
+            self._build_from_dataframe(dataframe, scaler)
+        else:
+            self.__read_data__()
+
+    def __read_data__(self):
+        self.scaler = StandardScaler()
+        df_raw = pd.read_csv(os.path.join(self.root_path, self.data_path))
+
+        '''
+        df_raw.columns: ['date', ...(other features), target feature]
+        '''
+        cols = list(df_raw.columns)
+        cols.remove(self.target)
+        cols.remove('date')
+        df_raw = df_raw[['date'] + cols + [self.target]]
+        num_train = int(len(df_raw) * 0.7)
+        num_test = int(len(df_raw) * 0.2)
+        num_vali = len(df_raw) - num_train - num_test
+        border1s = [0, num_train - self.seq_len, len(df_raw) - num_test - self.seq_len]
+        border2s = [num_train, num_train + num_vali, len(df_raw)]
+        border1 = border1s[self.set_type]
+        border2 = border2s[self.set_type]
+
+        if self.features == 'M' or self.features == 'MS':
+            cols_data = df_raw.columns[1:]
+            df_data = df_raw[cols_data]
+        elif self.features == 'S':
+            df_data = df_raw[[self.target]]
+
+        if self.scale:
+            train_data = df_data[border1s[0]:border2s[0]]
+            self.scaler.fit(train_data.values)
+            data = self.scaler.transform(df_data.values)
+        else:
+            data = df_data.values
+
+        df_stamp = df_raw[['date']][border1:border2].copy()
+        df_stamp['date'] = pd.to_datetime(df_stamp.date)
+        if self.timeenc == 0:
+            df_stamp['month'] = df_stamp.date.apply(lambda row: row.month)
+            df_stamp['day'] = df_stamp.date.apply(lambda row: row.day)
+            df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday())
+            df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour)
+            data_stamp = df_stamp.drop(['date'], axis=1).values
+        elif self.timeenc == 1:
+            data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
+            data_stamp = data_stamp.transpose(1, 0)
+
+        self.data_x = data[border1:border2]
+        self.data_y = data[border1:border2]
+        self.data_stamp = data_stamp
+
+    def __getitem__(self, index):
+        s_begin = index
+        s_end = s_begin + self.seq_len
+        r_begin = s_end - self.label_len
+        r_end = r_begin + self.label_len + self.pred_len
+
+        seq_x = self.data_x[s_begin:s_end]
+        seq_y = self.data_y[r_begin:r_end]
+        seq_x_mark = self.data_stamp[s_begin:s_end]
+        seq_y_mark = self.data_stamp[r_begin:r_end]
+
+        return seq_x, seq_y, seq_x_mark, seq_y_mark
+
+    def __len__(self):
+        return len(self.data_x) - self.seq_len - self.pred_len + 1
+
+    def inverse_transform(self, data):
+        return self.scaler.inverse_transform(data)
  
 ETT_DATASET_CLASSES = {
     "ETTh1": Dataset_ETT_hour,
@@ -427,6 +612,93 @@ def get_ett_client_datasets(
 
     client_datasets = [
         dataset_class(
+            root_path=root_path, flag="train", size=[seq_len, label_len, pred_len],
+            features=features, data_path=data_path, target=target, scale=scale,
+            timeenc=timeenc, freq=freq, dataframe=client_frame, scaler=scaler,
+        )
+        for client_frame in client_frames
+    ]
+    print(
+        f"{dataset}: {num_clients} clients x {len(client_frames[0])} rows "
+        f"-> {len(client_datasets[0])} windows per client"
+    )
+    return client_datasets
+
+CUSTOM_DATASET_FILES = {
+    "weather": "weather.csv",
+}
+
+
+def get_custom_dataset(
+    dataset="weather",
+    root_path=None,
+    data_path=None,
+    seq_len=96,
+    label_len=48,
+    pred_len=96,
+    features="M",
+    target="OT",
+    scale=True,
+    timeenc=0,
+    freq="h",
+):
+    """Centralised train/val/test for iTransformer 'custom' datasets (e.g. weather)."""
+    if root_path is None:
+        raise ValueError("root_path must be specified for custom dataset.")
+    if data_path is None:
+        data_path = CUSTOM_DATASET_FILES.get(dataset, f"{dataset}.csv")
+
+    common_kwargs = dict(
+        root_path=root_path, size=[seq_len, label_len, pred_len],
+        features=features, data_path=data_path, target=target,
+        scale=scale, timeenc=timeenc, freq=freq,
+    )
+    train_dataset = Dataset_Custom(flag="train", **common_kwargs)
+    validation_dataset = Dataset_Custom(flag="val", **common_kwargs)
+    test_dataset = Dataset_Custom(flag="test", **common_kwargs)
+
+    print(f"{dataset} training windows:", len(train_dataset))
+    print(f"{dataset} validation windows:", len(validation_dataset))
+    print(f"{dataset} test windows:", len(test_dataset))
+    return [train_dataset], [validation_dataset], [test_dataset]
+
+
+def get_custom_client_datasets(
+    dataset="weather",
+    root_path=None,
+    data_path=None,
+    num_clients=10,
+    seq_len=96,
+    label_len=48,
+    pred_len=96,
+    features="M",
+    target="OT",
+    scale=True,
+    timeenc=0,
+    freq="h",
+):
+    """Split the custom-dataset TRAIN split into `num_clients` equal datasets (one per FL client)."""
+    if root_path is None:
+        raise ValueError("root_path must be specified for custom dataset.")
+    if data_path is None:
+        data_path = CUSTOM_DATASET_FILES.get(dataset, f"{dataset}.csv")
+
+    frame, scaler = load_custom_dataframe(
+        root_path=root_path, data_path=data_path, flag="train",
+        seq_len=seq_len, features=features, target=target, scale=scale,
+        timeenc=timeenc, freq=freq,
+    )
+    client_frames = split_dataframe_equally(frame, num_clients)
+
+    min_rows = seq_len + pred_len
+    if len(client_frames[0]) < min_rows:
+        raise ValueError(
+            f"Each client has {len(client_frames[0])} rows but needs at least "
+            f"{min_rows} (seq_len + pred_len). Use fewer clients."
+        )
+
+    client_datasets = [
+        Dataset_Custom(
             root_path=root_path, flag="train", size=[seq_len, label_len, pred_len],
             features=features, data_path=data_path, target=target, scale=scale,
             timeenc=timeenc, freq=freq, dataframe=client_frame, scaler=scaler,
